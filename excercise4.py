@@ -12,6 +12,7 @@ class DataLoader:
     def __init__(self, file_paths):
         self.file_paths = file_paths
         self.data = {}
+        self.sort_position_data_by = 'Z'
         
     def load_all(self):
         for dist, path in self.file_paths.items():
@@ -51,7 +52,7 @@ class DataLoader:
 
             
             # Sort probes by Y coordinate horizontally
-            df = pd.DataFrame(extracted_probes).sort_values(by='Y').reset_index(drop=True)
+            df = pd.DataFrame(extracted_probes).sort_values(by=self.sort_position_data_by).reset_index(drop=True)
             self.data[dist] = df
         return self.data
 
@@ -182,48 +183,51 @@ class WindTunnelPlotter:
 
     def task_1(self):
         df_5D = self.data['5D']
-        y_pos, m_u, s_u, ti_u, uu, vv, ww, uv, uw, vw = self.analyzer.compute_profile_statistics(df_5D)
+        # Extract Z coordinate array instead of Y
+        z_pos = df_5D['Z'].values
+        _, m_u, s_u, ti_u, uu, vv, ww, uv, uw, vw = self.analyzer.compute_profile_statistics(df_5D)
         
         fig, axs = plt.subplots(2, 2, figsize=(12, 10))
-        fig.suptitle('Task 1: Horizontal Wake Profiles at 5D')
+        fig.suptitle('Task 1: Vertical Wake Profiles at 5D')
         
-        axs[0, 0].plot(y_pos, m_u, 'b-o')
+        axs[0, 0].plot(z_pos, m_u, 'b-o')
         axs[0, 0].set_title('Mean Velocity Ux')
         axs[0, 0].set_ylabel('Velocity [m/s]')
         
-        axs[0, 1].plot(y_pos, s_u, 'r-o')
+        axs[0, 1].plot(z_pos, s_u, 'r-o')
         axs[0, 1].set_title('Standard Deviation of Ux')
         
-        axs[1, 0].plot(y_pos, ti_u * 100, 'g-o')
+        axs[1, 0].plot(z_pos, ti_u * 100, 'g-o')
         axs[1, 0].set_title('Turbulence Intensity (%)')
         axs[1, 0].set_ylabel('TI [%]')
         
-        axs[1, 1].plot(y_pos, uu, label="u'u'")
-        axs[1, 1].plot(y_pos, vv, label="v'v'")
-        axs[1, 1].plot(y_pos, ww, label="w'w'")
-        axs[1, 1].plot(y_pos, uv, label="u'v'")
+        axs[1, 1].plot(z_pos, uu, label="u'u'")
+        axs[1, 1].plot(z_pos, vv, label="v'v'")
+        axs[1, 1].plot(z_pos, ww, label="w'w'")
+        axs[1, 1].plot(z_pos, uv, label="u'v'")
         axs[1, 1].set_title('Reynolds Stresses')
         axs[1, 1].legend()
         
         for ax in axs.flat:
-            ax.set_xlabel('y position [mm]')
+            ax.set_xlabel('z position [mm]')
             ax.grid(True)
         plt.tight_layout()
 
     def task_2_and_8(self):
         fig, axs = plt.subplots(1, 2, figsize=(14, 6))
-        fig.suptitle('Task 2 & 8: Mean Velocity Profiles and TI with Uncertainty')
+        fig.suptitle('Task 2 & 8: Vertical Mean Velocity Profiles and TI with Uncertainty')
         
         for dist in ['5D', '7.5D', '10D']:
             df = self.data[dist]
-            y_pos, m_u, s_u, ti_u, _, _, _, _, _, _ = self.analyzer.compute_profile_statistics(df)
+            z_pos = df['Z'].values
+            _, m_u, s_u, ti_u, _, _, _, _, _, _ = self.analyzer.compute_profile_statistics(df)
             n_samples = len(df['Ux'][0])
             
             # Task 8: Uncertainty calculation
             uncertainty = self.analyzer.compute_uncertainty(m_u, s_u, n_samples)
             
-            axs[0].errorbar(y_pos, m_u, yerr=uncertainty, fmt='-o', label=f'x = {dist}', capsize=3)
-            axs[1].plot(y_pos, ti_u * 100, '-o', label=f'x = {dist}')
+            axs[0].errorbar(z_pos, m_u, yerr=uncertainty, fmt='-o', label=f'x = {dist}', capsize=3)
+            axs[1].plot(z_pos, ti_u * 100, '-o', label=f'x = {dist}')
             
         axs[0].set_title('Mean Velocity (Ux) with 99.9% Conf. Error Bars')
         axs[0].set_ylabel('Velocity [m/s]')
@@ -231,27 +235,29 @@ class WindTunnelPlotter:
         axs[1].set_ylabel('TI [%]')
         
         for ax in axs:
-            ax.set_xlabel('y position [mm]')
+            ax.set_xlabel('z position [mm]')
             ax.legend()
             ax.grid(True)
         plt.tight_layout()
 
     def task_3(self):
         plt.figure(figsize=(10, 6))
-        plt.title('Task 3: Jensen Wake Model vs Experimental Data')
+        plt.title('Task 3: Jensen Wake Model vs Experimental Data (Vertical Axis)')
         
         colors = ['b', 'r', 'g']
         for i, dist_str in enumerate(['5D', '7.5D', '10D']):
             x_D = float(dist_str.replace('D', ''))
             df = self.data[dist_str]
-            y_pos, m_u, _, _, _, _, _, _, _, _ = self.analyzer.compute_profile_statistics(df)
+            z_pos = df['Z'].values
+            _, m_u, _, _, _, _, _, _, _, _ = self.analyzer.compute_profile_statistics(df)
             
-            jensen_u = self.aero_model.jensen_wake(x_D, y_pos)
+            # Evaluate the Jensen wake model using vertical coordinates instead of horizontal
+            jensen_u = self.aero_model.jensen_wake(x_D, z_pos)
             
-            plt.plot(y_pos, m_u, 'o', color=colors[i], label=f'Exp {dist_str}')
-            plt.plot(y_pos, jensen_u, '-', color=colors[i], label=f'Jensen {dist_str}')
+            plt.plot(z_pos, m_u, 'o', color=colors[i], label=f'Exp {dist_str}')
+            plt.plot(z_pos, jensen_u, '-', color=colors[i], label=f'Jensen {dist_str}')
             
-        plt.xlabel('y position [mm]')
+        plt.xlabel('z position [mm]')
         plt.ylabel('Velocity Ux [m/s]')
         plt.legend()
         plt.grid(True)
