@@ -1,8 +1,7 @@
-<<<<<<< HEAD
 # wind-tunnel-testing
 Repo for the course Wind Tunnel Testing of Windturbines at TUM in summer semester 26
-=======
-# G1 Wind-Tunnel Test-Matrix Generator (Group 2)
+
+## G1 Wind-Tunnel Test-Matrix Generator (Group 2)
 
 > Automated generation of the **Task 1 (rotor performance)** and **Task 2 (wake survey)**
 > Excel test matrices for the **G1** scaled wind-turbine model, for the TUM *Wind Tunnel
@@ -527,7 +526,7 @@ data = mat["Reynolds"].LookUp[2]   # index 2 → Re = 75000
 
 **Interpolation.** Linear `RegularGridInterpolator` with `bounds_error=True` (off-grid
 requests raise rather than extrapolate). The **optimum** $(\lambda, \beta)$ is the grid
-maximum of $C_P$: $C_P = 0.406$ at $\lambda = 7.05$, $\beta = 0.4^\circ$ (≈ 0° as instructed).
+maximum of $C_P$: $C_P = 0.406$ at $\lambda = 7.05$, $\beta = 0.4^\circ$.
 
 > *Implemented by:* `lookup_table.G1LookUpTable`.
 
@@ -921,6 +920,4 @@ as physically expected for a fixed rotation direction.
 
 ---
 
-*Generated for the TUM Wind Tunnel Testing lab course — Group 2. All formulas in
-Section 7 correspond one-to-one to the named functions in the `wtt/` package.*
->>>>>>> d428134 (running test matrix code)
+All formulas in Section 7 correspond one-to-one to the named functions in the `wtt/` package.*
