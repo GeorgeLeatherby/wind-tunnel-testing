@@ -2,23 +2,25 @@
 Task-1 (performance) test-matrix builder for Group 2.
 
 Group 2 measures three performance curves at yaw = 0, +30 and -30 degrees, each
-at Re = 75000 and the optimum (here: 0 deg) blade pitch, sweeping the tip-speed
-ratio. A total of 30 measurement points is required, i.e. 10 TSR points per yaw.
+at Re = 75000 and the optimum blade pitch, sweeping the tip-speed ratio.
 
-Design choice (documented): the dominant requirement is "Re = 75000 (+/- 2000)".
-To honour it we build *constant-Reynolds* curves: for every TSR point the wind
-speed is re-solved so the midspan Reynolds number equals 75000, and the rotor
-speed follows from TSR. Because the relative velocity grows with TSR, the
-calibrated wind speed decreases as TSR increases, which automatically produces a
-spread of wind speeds across the sweep (checked afterwards against the
-"avoid wind-speed changes < 0.5 m/s" guideline and the rpm / power / torque
-limits).
+Design choice (documented): the dominant requirement is "Re = 75000 (+/- 2000)",
+but the tunnel speed can only be SET in finite steps, so we drive the sweep by
+the *requested tunnel speed* rather than by TSR. For each yaw the requested speed
+is stepped in `performance_speed_step` (0.5 m/s) increments across the achievable
+constant-Reynolds range, starting at the lowest feasible speed; for every speed
+we re-solve the TSR that keeps the midspan Reynolds number at 75000. This makes
+the "Requested wind speed" column contain only values the operator can dial in,
+while Re stays exactly on target.
 
-The TSR sweep is centred on the target TSR (7.05) and kept inside the Group-2
-band [5.5, 9].
+Because only a handful of 0.5 m/s steps are feasible, Task 1 yields fewer than 30
+points (the assignment caps it at 30, and fewer is acceptable). Rows are finally
+ordered by requested wind speed - the hardest parameter to set in the tunnel.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
@@ -28,48 +30,72 @@ from .test_matrix_row import G1_MEASUREMENT_COLUMNS, TestMatrixRow
 
 
 class Task1PerformanceBuilder:
-    """Builds the 30-row performance test matrix."""
+    """Builds the performance test matrix (constant Re, stepped tunnel speed)."""
 
     def __init__(self, config: CampaignConfig, solver: OperatingPointSolver) -> None:
         self._config = config
         self._solver = solver
 
-    def _tsr_sweep(self) -> np.ndarray:
+    def _speed_sweep_for_yaw(self, yaw_deg: float) -> np.ndarray:
         """
-        TSR values for one yaw curve.
+        Requested tunnel speeds [m/s] for one yaw curve, in 0.5 m/s steps.
 
-        Evenly spaced across the verified *feasible* TSR band, with
-        `performance_points_per_yaw` samples. The feasible band is narrower than
-        the raw limit band so that every constant-Reynolds point respects the
-        power / torque / rotor-speed limits, while still bracketing the optimum
-        TSR (7.05).
+        The achievable constant-Reynolds speed range is bounded by the feasible
+        TSR band: the lowest speed is the one commanded at the highest feasible TSR
+        and the highest speed the one commanded at the lowest feasible TSR (the
+        commanded speed decreases with TSR at fixed Re). We then take every
+        `performance_speed_step` multiple inside that range, starting at the lowest
+        feasible step. Raises if no step fits (a configuration error).
         """
-        return np.linspace(
-            self._config.performance_tsr_sweep_min,
-            self._config.performance_tsr_sweep_max,
-            self._config.performance_points_per_yaw,
-        )
+        pitch = self._config.targets.optimum_pitch_deg
+        target_re = self._config.targets.target_reynolds
+        tsr_lo = self._config.performance_tsr_feasible_min
+        tsr_hi = self._config.performance_tsr_feasible_max
+        step = self._config.performance_speed_step
+
+        lowest_speed = self._solver.solve_for_target_reynolds(
+            tsr=tsr_hi, pitch_deg=pitch, yaw_deg=yaw_deg, target_reynolds=target_re
+        ).requested_tunnel_speed
+        highest_speed = self._solver.solve_for_target_reynolds(
+            tsr=tsr_lo, pitch_deg=pitch, yaw_deg=yaw_deg, target_reynolds=target_re
+        ).requested_tunnel_speed
+
+        first = math.ceil(lowest_speed / step - 1e-9) * step
+        last = math.floor(highest_speed / step + 1e-9) * step
+        if last < first:
+            raise ValueError(
+                f"No {step} m/s tunnel-speed step is feasible for yaw {yaw_deg:+.0f} "
+                f"(achievable range {lowest_speed:.2f}-{highest_speed:.2f} m/s)."
+            )
+        return np.arange(first, last + 0.5 * step, step)
 
     def build_results(self) -> list[OperatingPointResult]:
         """
-        Solve every (yaw, TSR) operating point and return the raw physics results.
+        Solve every (yaw, requested-speed) operating point at constant Reynolds.
 
-        Pitch is held at the configured optimum value; Reynolds is calibrated to
-        the target for each point.
+        For each requested tunnel speed the TSR is re-solved so the midspan
+        Reynolds number equals the target; pitch is held at the optimum. Results
+        are ordered by requested wind speed, then by yaw.
         """
         results: list[OperatingPointResult] = []
         pitch = self._config.targets.optimum_pitch_deg
         target_re = self._config.targets.target_reynolds
+        tsr_lo = self._config.performance_tsr_feasible_min
+        tsr_hi = self._config.performance_tsr_feasible_max
 
         for yaw in self._config.yaw.yaw_angles_deg:
-            for tsr in self._tsr_sweep():
-                result = self._solver.solve_for_target_reynolds(
-                    tsr=float(tsr),
+            for speed in self._speed_sweep_for_yaw(yaw):
+                result = self._solver.solve_for_target_reynolds_at_tunnel_speed(
+                    requested_tunnel_speed=float(speed),
                     pitch_deg=pitch,
                     yaw_deg=yaw,
                     target_reynolds=target_re,
+                    tsr_search_min=tsr_lo,
+                    tsr_search_max=tsr_hi,
                 )
                 results.append(result)
+
+        results.sort(key=lambda r: (round(r.requested_tunnel_speed, 3), r.yaw_deg))
         return results
 
     def build_rows(self) -> list[TestMatrixRow]:

@@ -29,6 +29,7 @@ from wtt.scaling import samsung_s7_reference
 from wtt.scaling_report import ScalingReport
 from wtt.task1_builder import Task1PerformanceBuilder
 from wtt.task2_builder import Task2WakeBuilder
+from wtt.traverse_writer import TraversePositionWriter
 from wtt.yaw_model import YawPerformanceModel
 
 
@@ -36,6 +37,7 @@ from wtt.yaw_model import YawPerformanceModel
 LOOKUP_TABLE_PATH = "LookUpTable_G1.mat"
 TASK1_OUTPUT = "Task1_Performance_TestMatrix_Group2.xlsx"
 TASK2_OUTPUT = "Task2_Wake_TestMatrix_Group2.xlsx"
+TASK2_TRAVERSE_OUTPUT = "Task2_Wake_TraversePositions_Group2.txt"
 
 # Speed search interval for the Reynolds calibration root find [m/s].
 # Wide enough to bracket the solution for every TSR in the sweep; if the target
@@ -108,7 +110,11 @@ def print_summary(config, lookup_table: G1LookUpTable, solver: OperatingPointSol
     )
     print(f"  Target Reynolds          : {config.targets.target_reynolds:.0f}")
     print(f"  Target TSR               : {config.targets.target_tsr:.3f}")
-    print(f"  Wake station X = 3D      : {config.wake.downstream_distance:.4f} m")
+    traverse_x = config.wake.downstream_distance - config.wake.traverse_home_offset
+    print(
+        f"  Wake station X (2D)      : {config.wake.downstream_distance:.4f} m "
+        f"behind rotor (traverse X = {traverse_x * 1000:.0f} mm)"
+    )
 
 
 def main() -> None:
@@ -130,11 +136,11 @@ def main() -> None:
     # Scaling report: relate the G1 model to its full-scale reference using the
     # representative (optimum) operating rotor speed for the time scale.
     optimum = lookup_table.optimum_operating_point()
-    optimum_rpm = solver.solve_for_fixed_speed(
+    optimum_rpm = solver.solve_for_fixed_tunnel_speed(
         tsr=optimum.tsr,
         pitch_deg=config.targets.optimum_pitch_deg,
         yaw_deg=0.0,
-        free_air_speed=config.wake.free_stream_speed,
+        requested_tunnel_speed=config.wake.requested_tunnel_speed,
     ).rotor_speed_rpm
     scaling_report = ScalingReport(
         full_scale=samsung_s7_reference(),
@@ -171,8 +177,10 @@ def main() -> None:
         file_path=TASK2_OUTPUT,
         scaling_rows=scaling_rows,
     )
+    TraversePositionWriter().write(rows=task2_rows, file_path=TASK2_TRAVERSE_OUTPUT)
     print(f"\nWrote {len(task1_rows)} rows -> {TASK1_OUTPUT}")
     print(f"Wrote {len(task2_rows)} rows -> {TASK2_OUTPUT}")
+    print(f"Wrote {len(task2_rows)} positions -> {TASK2_TRAVERSE_OUTPUT}")
 
     # 7. Verify constraints (Reynolds enforced only for the performance task).
     report_constraints("Task 1 (performance)", task1_results, config, enforce_reynolds=True)

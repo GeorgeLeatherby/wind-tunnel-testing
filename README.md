@@ -54,8 +54,9 @@ blank columns for the channels the G1 model records.
 
 | File | Task | Rows | Contents |
 |------|------|------|----------|
-| `Task1_Performance_TestMatrix_Group2.xlsx` | Performance | 30 | $C_P(\lambda)$ / $C_T(\lambda)$ curves at three yaw angles |
-| `Task2_Wake_TestMatrix_Group2.xlsx` | Wake | 70 | Hub-height wake survey at one downstream station, three yaw angles |
+| `Task1_Performance_TestMatrix_Group2.xlsx` | Performance | 15 | $C_P(\lambda)$ / $C_T(\lambda)$ curves at three yaw angles, stepped in tunnel speed |
+| `Task2_Wake_TestMatrix_Group2.xlsx` | Wake | 69 | Wake survey on a $y$–$z$ plane at one downstream station, three yaw angles |
+| `Task2_Wake_TraversePositions_Group2.txt` | Wake | 69 | TAB-separated traverse input ($x\;y\;z\;A$) for the probe positions |
 
 Each workbook also carries a second sheet, **“Scaling (model-full)”**, listing the applied
 model↔full-scale similarity factors.
@@ -65,9 +66,13 @@ model↔full-scale similarity factors.
 Group 2 measures at yaw angles $\gamma = 0^\circ,\,+30^\circ,\,-30^\circ$:
 
 * **Performance:** three $C_P$/$C_T$ curves at $Re = 75\,000\ (\pm 2000)$, optimum blade
-  pitch, **varying** TSR — 30 points total.
-* **Wake:** wake shape at **one** downstream location, prescribed wind speed
-  $U_\infty = 5.4\ \mathrm{m/s}$, optimum pitch and **optimum** TSR — 70 points total.
+  pitch, **varying** TSR. The *requested (tunnel) wind speed* is stepped in $0.5\ \mathrm{m/s}$
+  increments (the tunnel's speed-setting resolution); for each step the TSR is re-solved to
+  keep $Re = 75\,000$. Only a few speeds per yaw are feasible — **15 points total** (≤ 30,
+  the assignment cap).
+* **Wake:** wake shape on a $y$–$z$ **plane** at **one** downstream location, *requested*
+  tunnel speed $U_\mathrm{tunnel} = 5.4\ \mathrm{m/s}$, optimum pitch and **optimum** TSR —
+  **69 points total** (23 per yaw).
 
 ### 1.4 Hard Constraints (Group 2)
 
@@ -114,7 +119,12 @@ report, then writes the two `.xlsx` files.
   Tunnel cross-section area: 4.8600 m^2
   Blockage ratio alpha     : 19.10 %
   Table optimum            : Cp=0.4063 at TSR=7.050, pitch=0.40 deg
+  Wake station X (2D)      : 2.2000 m behind rotor (traverse X = 1650 mm)
 ...
+Wrote 15 rows -> Task1_Performance_TestMatrix_Group2.xlsx
+Wrote 69 rows -> Task2_Wake_TestMatrix_Group2.xlsx
+Wrote 69 positions -> Task2_Wake_TraversePositions_Group2.txt
+
 === Constraint check: Task 1 (performance) ===
   All rows satisfy the Group-2 constraints.
 === Constraint check: Task 2 (wake) ===
@@ -131,6 +141,7 @@ wind-tunnel-testing/
 ├── LookUpTable_G1.mat               # G1 aerodynamic look-up table (input)
 ├── Task1_Performance_TestMatrix_Group2.xlsx   # Output (generated)
 ├── Task2_Wake_TestMatrix_Group2.xlsx          # Output (generated)
+├── Task2_Wake_TraversePositions_Group2.txt    # Output (generated, traverse input)
 └── wtt/                             # Package: one concept per module
     ├── __init__.py                  # Public exports
     ├── air_properties.py            # Air density & viscosity (ideal gas, 20 °C)
@@ -142,14 +153,15 @@ wind-tunnel-testing/
     ├── reynolds_calibration.py      # Solve U' for target Reynolds
     ├── scaling.py                   # Lecture-1 similarity scale factors
     ├── scaling_report.py            # Applies scaling to G1 ↔ full scale
-    ├── wake_model.py                # Jiménez deflection + point distribution
+    ├── wake_model.py                # Jiménez deflection + y-z plane points
     ├── yaw_model.py                 # Yaw cosine-loss + rotational asymmetry
     ├── operating_point.py           # Assembles the full physics chain
     ├── constraints.py               # Group-2 limit checks
     ├── test_matrix_row.py           # Row schema + measured-channel columns
-    ├── task1_builder.py             # Builds the 30-row performance matrix
-    ├── task2_builder.py             # Builds the 70-row wake matrix
-    └── excel_writer.py              # Styled .xlsx writer (+ scaling sheet)
+    ├── task1_builder.py             # Builds the speed-stepped performance matrix
+    ├── task2_builder.py             # Builds the y-z-plane wake matrix
+    ├── excel_writer.py              # Styled .xlsx writer (+ scaling sheet)
+    └── traverse_writer.py           # TAB-separated traverse-position .txt writer
 ```
 
 > **Note on the file name `campaign_config.py`:** a module literally named `config.py`
@@ -211,9 +223,11 @@ graph TD
     T2 --> WM
     EW[excel_writer] --> SR
     EW --> TR
+    TW[traverse_writer] --> TR
     MAIN[generate_test_matrices] --> T1
     MAIN --> T2
     MAIN --> EW
+    MAIN --> TW
     MAIN --> CN
     MAIN --> SR
 ```
@@ -225,15 +239,17 @@ flowchart LR
     A[Load LookUpTable_G1.mat<br/>Re = 75000 slice] --> B[Read geometry<br/>R, r_mid, chord_mid]
     B --> C[Build Group-2 config]
     C --> D[Assemble OperatingPointSolver<br/>air + blockage + Re calibrator]
-    D --> E1[Task 1 builder<br/>30 points]
-    D --> E2[Task 2 builder<br/>70 points]
+    D --> E1[Task 1 builder<br/>15 points]
+    D --> E2[Task 2 builder<br/>69 points]
     E1 --> F[Excel writer]
     E2 --> F
+    E2 --> TW[Traverse .txt writer]
     D --> G[Scaling report]
     G --> F
     E1 --> H[Constraint check]
     E2 --> H
     F --> I[(2 .xlsx files)]
+    TW --> K[(1 .txt file)]
     H --> J[Console report]
 ```
 
@@ -252,14 +268,15 @@ flowchart LR
 | `reynolds_calibration` | `ReynoldsCalibrator` | Root-solves the free-air speed that yields $Re = 75000$ at midspan |
 | `scaling` | `length_scale`, `velocity_scale`, `power_scale`, `torque_scale`, `force_scale`, `bending_stiffness_scale`, `samsung_s7_reference` | Lecture-1 similarity scale factors |
 | `scaling_report` | `ScalingReport`, `ScalingFactorRow` | Applies the scale factors to relate G1 ↔ Samsung S7.0-171 |
-| `wake_model` | `initial_skew_angle`, `wake_center_offset`, `wake_radius`, `centered_lateral_positions`, `fitted_half_width` | Jiménez wake deflection; hub-height point distribution |
+| `wake_model` | `initial_skew_angle`, `wake_center_offset`, `wake_radius`, `centered_lateral_positions`, `reachable_radius`, `concentric_ring_positions` | Jiménez wake deflection; $y$–$z$ plane point distribution (hub line + concentric circles) |
 | `yaw_model` | `cosine_loss`, `advance_ratio`, `rotational_asymmetry_factor`, `YawPerformanceModel` | Yaw cosine-loss ($\cos^p\gamma$) and advancing/retreating sign asymmetry |
-| `operating_point` | `OperatingPointSolver`, `OperatingPointResult`, `tangential_induction_from_torque` | Assembles the full physics chain for one $(\lambda, \beta, \gamma)$, including the yaw correction |
+| `operating_point` | `OperatingPointSolver` (`solve_for_target_reynolds`, `solve_for_target_reynolds_at_tunnel_speed`, `solve_for_fixed_speed`, `solve_for_fixed_tunnel_speed`), `OperatingPointResult`, `tangential_induction_from_torque` | Assembles the full physics chain for one $(\lambda, \beta, \gamma)$, including the yaw correction |
 | `constraints` | `check_row` + per-limit predicates | Group-2 limit verification |
 | `test_matrix_row` | `TestMatrixRow`, `G1_MEASUREMENT_COLUMNS` | Row schema and the blank measured-channel column names |
-| `task1_builder` | `Task1PerformanceBuilder` | Builds the 30-row constant-$Re$ performance matrix |
-| `task2_builder` | `Task2WakeBuilder` | Builds the 70-row wake matrix |
+| `task1_builder` | `Task1PerformanceBuilder` | Builds the speed-stepped constant-$Re$ performance matrix (15 rows) |
+| `task2_builder` | `Task2WakeBuilder` | Builds the $y$–$z$-plane wake matrix (69 rows) |
 | `excel_writer` | `TestMatrixExcelWriter` | Writes a styled workbook with the matrix and the scaling sheet |
+| `traverse_writer` | `TraversePositionWriter` | Writes the TAB-separated $x\;y\;z\;A$ traverse-input file (Task 2) |
 
 ### 5.1 Core API Sketch
 
@@ -271,15 +288,18 @@ from wtt.campaign_config import build_group2_campaign
 table  = G1LookUpTable("LookUpTable_G1.mat")        # Re = 75000 slice
 config = build_group2_campaign("LookUpTable_G1.mat", table.rotor_diameter())
 
-# One operating point, constant-Re path (Task 1):
-res = solver.solve_for_target_reynolds(tsr=7.0, pitch_deg=0.0, yaw_deg=0.0,
-                                       target_reynolds=75_000)
+# One operating point, constant-Re path (Task 1) at a prescribed tunnel speed:
+res = solver.solve_for_target_reynolds_at_tunnel_speed(
+    requested_tunnel_speed=5.0, pitch_deg=0.4, yaw_deg=0.0,
+    target_reynolds=75_000, tsr_search_min=6.0, tsr_search_max=9.0)
+# res.tsr is re-solved so res.reynolds == 75000 at exactly that tunnel speed.
 # res.requested_tunnel_speed, res.rotor_speed_rpm, res.cp, res.ct_thrust,
 # res.power_w, res.thrust_n, res.torque_nm, res.reynolds ...
 
-# One operating point, fixed-speed path (Task 2):
-res = solver.solve_for_fixed_speed(tsr=7.05, pitch_deg=0.0, yaw_deg=30.0,
-                                   free_air_speed=5.4)
+# One operating point, fixed (settable) tunnel-speed path (Task 2):
+res = solver.solve_for_fixed_tunnel_speed(tsr=7.05, pitch_deg=0.4, yaw_deg=30.0,
+                                          requested_tunnel_speed=5.4)
+# res.requested_tunnel_speed == 5.4; res.equivalent_free_air_speed > 5.4 (blockage).
 ```
 
 ---
@@ -294,17 +314,25 @@ All campaign numbers are defined once in `build_group2_campaign()`:
 | Targets | `target_reynolds` | $75\,000$ | Assignment |
 | Targets | `target_tsr` | $7.05$ | Assignment |
 | Targets | `optimum_pitch_deg` | $0.4^\circ$ (parameterised) | Assignment / table optimum |
-| Wake | `free_stream_speed` | $5.4\ \mathrm{m/s}$ | Group-2 brief |
-| Wake | `downstream_distance` | $3D = 3.262\ \mathrm{m}$ | Design choice |
+| Wake | `requested_tunnel_speed` | $5.4\ \mathrm{m/s}$ (tunnel command) | Group-2 brief |
+| Wake | `nominal_rotor_diameter` | $1.1\ \mathrm{m}$ ($1D = 1100\ \mathrm{mm}$) | Lecture 5 traverse convention |
+| Wake | `downstream_distance` | $2D = 2.2\ \mathrm{m}$ behind rotor | Design choice (§8.2) |
+| Wake | `traverse_home_offset` | $0.5D = 0.55\ \mathrm{m}$ behind rotor | Lecture 5 (home position) |
 | Wake | `wake_expansion_coefficient` $k_d$ | $0.07$ | Typical value |
+| Wake | `hubline_points` / `circle_rings_points` | $9$ / $(6, 8)$ → 23/yaw | Design (§8.2) |
+| Wake | `measuring_area_fraction` / `hubline_span_factor` | $0.85$ / $1.2$ | Design (§8.2) |
 | Wake | traverse limits | $0<X<3850$, $-1000<Y<1000$, $-700<Z<600\ \mathrm{mm}$ | Lecture 5 |
 | Yaw | `yaw_angles_deg` | $(0, +30, -30)$ | Group-2 brief |
 | Yaw model | `power_cosine_exponent` / `thrust_cosine_exponent` | $3.0$ / $2.0$ | Momentum theory (§7.9) |
 | Yaw model | `rotational_asymmetry` $k_\gamma$ | $0.10$ (calibrate to data) | $\pm\gamma$ asymmetry (§7.9) |
-| Task 1 | `performance_tsr_sweep_min/max` | $[6.0, 9.0]$ | Verified feasible band (§8.1) |
+| Task 1 | `performance_tsr_feasible_min/max` | $[6.0, 9.0]$ | Verified feasible TSR bracket (§8.1) |
+| Task 1 | `performance_speed_step` | $0.5\ \mathrm{m/s}$ | Tunnel speed-setting resolution (§8.1) |
 
-The **rotor diameter is not hard-coded** — it is read from the look-up table geometry
-($D = 2R_{\mathrm{tip}}$) so geometry and configuration cannot drift apart.
+The **rotor diameter is not hard-coded** — the *aerodynamic* diameter is read from the
+look-up table geometry ($D = 2R_{\mathrm{tip}} = 1.0872\ \mathrm{m}$) and drives the wake
+physics, while the **nominal** $1D = 1.1\ \mathrm{m}$ (lecture/traverse convention) places
+the downstream station and the home offset. Geometry and configuration therefore cannot
+drift apart.
 
 ---
 
@@ -391,10 +419,12 @@ not enforced (rigid-performance scope).
 
 **Application in this tool.** `ScalingReport` evaluates these factors for the G1 against the
 Samsung S7.0-171 reference (`samsung_s7_reference`), using the model’s representative
-operating rotor speed (optimum TSR at the wake-survey wind speed, $\approx 669\ \mathrm{rpm}$).
-The result is written to the *“Scaling (model-full)”* sheet of each workbook. For the G1:
-$n_L = 6.35\times10^{-3}$, $n_T = 64.3$, giving a velocity scale of $0.41$ (i.e. a
-$5.4\ \mathrm{m/s}$ model wind speed represents $\approx 13\ \mathrm{m/s}$ full scale).
+operating rotor speed (optimum TSR at the wake-survey condition, $\approx 772\ \mathrm{rpm}$
+— higher than a naive estimate because the corrected blockage direction raises the
+equivalent free-air speed at the fixed tunnel speed, see §7.10). The result is written to the
+*“Scaling (model-full)”* sheet of each workbook. For the G1:
+$n_L = 6.35\times10^{-3}$, $n_T = 74.2$, giving a velocity scale of $0.47$ (i.e. a
+$5.4\ \mathrm{m/s}$ model wind speed represents $\approx 11.5\ \mathrm{m/s}$ full scale).
 
 ### 7.5 Reynolds-Number Similarity and Calibration
 
@@ -577,16 +607,20 @@ deliberately left **uncorrected**: they feed the Reynolds calibration, which is 
 rotor speed and is essentially yaw-independent, so $Re$ and the commanded rpm stay constant
 across yaw.
 
-At $\lambda = 7.05$, $\beta = 0.4^\circ$ the corrected coefficients are:
+At $\lambda = 7.05$, $\beta = 0.4^\circ$, evaluated at the Task-2 wake condition (requested
+tunnel speed $5.4\ \mathrm{m/s}$, so the equivalent free-air speed $U'_\infty$ differs per yaw
+through the blockage correction), the corrected coefficients and loads are:
 
-| $\gamma$ | $C_P$ | $C_T$ | $P$ [W] | $Q$ [Nm] | $T$ [N] |
-|----:|------:|------:|------:|-------:|------:|
-| $0^\circ$ | 0.406 | 0.764 | 49.5 | 0.634 | 15.46 |
-| $+30^\circ$ | 0.266 | 0.577 | 32.4 | 0.415 | 11.68 |
-| $-30^\circ$ | 0.262 | 0.569 | 31.9 | 0.409 | 11.51 |
+| $\gamma$ | $C_P$ | $C_T$ | $U'_\infty$ [m/s] | $P$ [W] | $Q$ [Nm] | $T$ [N] |
+|----:|------:|------:|------:|------:|-------:|------:|
+| $0^\circ$ | 0.406 | 0.764 | 6.23 | 55.0 | 0.680 | 16.59 |
+| $+30^\circ$ | 0.266 | 0.577 | 5.75 | 28.3 | 0.379 | 10.67 |
+| $-30^\circ$ | 0.262 | 0.569 | 5.74 | 27.7 | 0.372 | 10.47 |
 
 with $\cos^3 30^\circ = 0.650$, $\cos^2 30^\circ = 0.750$ and $\mu_a(\pm30^\circ)=\pm0.071$
-producing the $\approx 1.4\%$ split between the two yaw signs.
+producing the $\approx 1.4\%$ split between the two yaw signs (in $C_P$: 0.2658 vs 0.2620).
+The loads also reflect the yaw-dependent $U'_\infty$: a yawed rotor has lower thrust, hence
+less blockage, hence a lower equivalent free-air speed at the same commanded tunnel speed.
 
 > *Implemented by:* `yaw_model.*` (`cosine_loss`, `advance_ratio`,
 > `rotational_asymmetry_factor`, `YawPerformanceModel`); applied in
@@ -611,15 +645,20 @@ C_T = \frac{T}{\tfrac{1}{2}\rho A_R U_\infty^2}\ \text{(thrust)} .
 $$
 
 **Direction of use.** The Reynolds calibration and coefficient tables are defined in
-**free-air** terms, so we first fix $U'_\infty$ (the speed the rotor must feel) and then
-command the tunnel to the **lower** speed that the walls will accelerate back up:
+**free-air** terms, and the campaign uses the correction in two directions:
 
-$$
-U_{\text{tunnel}} = \frac{U'_\infty}{1 + \dfrac{\alpha}{4}\dfrac{C_T}{1 - C_T}} .
-$$
+* **Task 1 (performance).** We first fix $U'_\infty$ (the speed the rotor must feel to reach
+  $Re = 75\,000$) and command the tunnel to the **lower** speed the walls accelerate back up:
+  $$
+  U_{\text{tunnel}} = \frac{U'_\infty}{1 + \dfrac{\alpha}{4}\dfrac{C_T}{1 - C_T}} .
+  $$
+* **Task 2 (wake).** Here the **tunnel speed is the prescribed quantity** ($5.4\ \mathrm{m/s}$),
+  so we invert the relation to recover the **higher** equivalent free-air speed the rotor
+  feels, $U'_\infty = U_{\text{tunnel}}\,\big(1 + \tfrac{\alpha}{4}\tfrac{C_T}{1-C_T}\big)$, and
+  report the resulting Reynolds number (it is not forced to 75 000).
 
-This is the **“Requested wind speed”** column; $U'_\infty$ is reported alongside as
-**“Equivalent free-air U′”**.
+In both cases the **“Requested wind speed”** column is $U_{\text{tunnel}}$ (what the operator
+sets) and $U'_\infty$ is reported alongside as **“Equivalent free-air U′”**.
 
 **Alternative (not used).** The slides also give the Mikkelsen & Sørensen correction
 $\frac{U'_\infty}{U_\infty} = \epsilon - \frac{C_T}{4\epsilon}$; Glauert was selected per the
@@ -655,23 +694,28 @@ $$
 
 with wake-expansion coefficient $k_d = 0.07$ and approximate wake radius
 $r_w(x) = R + k_d x$. At $\gamma = 0$, $\xi_0 = 0 \Rightarrow \delta = 0$; the sign of
-$\delta$ follows the sign of $\gamma$. For the G1 at $X = 3D$: $\delta(\pm30^\circ) \approx
-\pm 338\ \mathrm{mm}\ (\approx \pm0.31D)$.
+$\delta$ follows the sign of $\gamma$. For the G1 at the chosen $X = 2D$ station:
+$\delta(\pm30^\circ) \approx \pm 185\ \mathrm{mm}$ and $r_w \approx 698\ \mathrm{mm}$.
 
-**Point distribution.** For each yaw the hub-height ($Z = 0$) survey line is **cosine-spaced**
-(denser near the center, where the deficit gradient — and hence the center information — is
-strongest) over a half-width $1.5\,r_w(x)$, **fitted** to the traverse limits so no point is
-clipped:
+**Point distribution on the $y$–$z$ plane.** Group 2 surveys a full $y$–$z$ **plane** at the
+station, centred on the deflected wake center $(Y_c, Z_c) = (\delta(x), 0)$. The 23 points
+per yaw are split into two complementary groups (see §8.2):
 
-$$
-w_{\text{half}} = \min\!\big(1.5\,r_w,\; c - Y_{\min},\; Y_{\max} - c\big), \quad c = \delta(x) .
-$$
+* a **hub-height line** ($Z = 0$), cosine-spaced in $Y$ (denser near the center, where the
+  deficit gradient — and hence the center information — is strongest), reaching
+  $\le \min\!\big(1.2\,r_w,\; 0.85\cdot\text{lateral room}\big)$ either side of $Y_c$; and
+* a set of **concentric circles** centred on $(Y_c, 0)$ with equal-area radii out to
+  $0.85\times r_{\text{reach}}$, where $r_{\text{reach}}$ is the largest circle that fits the
+  traverse window. The vertical reach ($+600 / -700\ \mathrm{mm}$ about hub) is the binding
+  limit, so the circles capture the wake core while the hub line captures the full lateral
+  width.
 
 **Connection to wake-center tracking research.** Cacciola *et al.* (2016, *The Science of
 Making Torque from Wind*) show the wake center can be reconstructed from downstream-turbine
 hub loads (nodding/yawing moments → horizontal/vertical shears) fitted to a Larsen wake
-model, with best accuracy for overlap $|d/D| > 0.4$. The dense-near-center distribution here
-mirrors that guidance: it best resolves the deficit profile needed to best-fit the center.
+model, with best accuracy for overlap $|d/D| > 0.4$. The hub-height line (dense near center)
+is what calibrates that lateral wake-center model; the concentric circles add real in-plane
+samples to validate and graph the 2-D wake shape.
 
 > *Implemented by:* `wake_model.*`, `task2_builder.Task2WakeBuilder`.
 
@@ -694,67 +738,100 @@ constants of the reference state, not tuning defaults.
 
 ## 8. Test-Matrix Design
 
-### 8.1 Task 1 — Performance (30 points)
+### 8.1 Task 1 — Performance (15 points)
 
 **Goal:** three $C_P(\lambda)$ / $C_T(\lambda)$ curves at $\gamma = 0^\circ, +30^\circ,
 -30^\circ$, $Re = 75\,000$, optimum pitch.
 
-**Method — constant-Reynolds curves.** The dominant requirement is $Re = 75\,000\,(\pm2000)$.
-For every TSR the wind speed is **re-solved** so $Re = 75\,000$ exactly, and the rotor speed
-follows from $\Omega = \lambda U'_\infty / R$. Because $v_{\text{rel}}$ grows with $\lambda$,
-the calibrated speed **decreases** as $\lambda$ increases, naturally producing a spread of
-wind speeds across the sweep.
+**Method — stepped tunnel speed at constant Reynolds.** The dominant requirement is
+$Re = 75\,000\,(\pm2000)$, but the tunnel speed can only be **set in $0.5\ \mathrm{m/s}$
+steps**. So instead of sweeping TSR we sweep the **requested (tunnel) wind speed** on the
+$0.5\ \mathrm{m/s}$ grid; for each speed the TSR is **re-solved** (bracketed root find) so that
+$Re = 75\,000$ exactly, and the rotor speed follows from $\Omega = \lambda U'_\infty / R$.
+This keeps the “Requested wind speed” column on values the operator can actually dial in while
+holding $Re$ on target.
 
-**Feasible TSR band.** At constant $Re$, power ($\propto U^3$) and torque rise toward low
-TSR. A sweep over the full $[5.5, 9]$ band would breach the 75 W / 1 Nm limits at the low
-end, so the **verified feasible band $[6.0, 9.0]$** is used (10 points per yaw):
+**Feasible speed range (per yaw).** At constant $Re$ the commanded speed decreases with TSR,
+so the achievable band runs from $U_{\text{tunnel}}(\lambda = 9)$ up to
+$U_{\text{tunnel}}(\lambda = 6)$ — the bracket $[6, 9]$ keeps power/torque within limits (a sweep
+down to $\lambda = 5.5$ would breach 75 W / 1 Nm). Because the blockage correction depends on
+yaw, the band shifts slightly per yaw: the zero-yaw curve runs $4.0\text{–}6.0\ \mathrm{m/s}$
+and the $\pm30^\circ$ curves $4.5\text{–}6.5\ \mathrm{m/s}$ — **5 points per yaw, 15 total**
+(≤ 30, the cap; fewer points are acceptable). The zero-yaw curve:
 
-| $\lambda$ | $U'_\infty$ [m/s] | $U_{\text{tunnel}}$ [m/s] | rpm | $C_P$ | $P$ [W] | $Q$ [Nm] | Status |
-|-----:|----:|----:|----:|----:|----:|----:|:--|
-| 5.50 | 7.57 | 7.05 | 732 | 0.338 | 82.0 | 1.07 | ✗ P, Q |
-| 5.75 | 7.28 | 6.67 | 735 | 0.370 | 79.7 | 1.04 | ✗ P |
-| **6.00** | 7.00 | 6.34 | 738 | 0.382 | 73.2 | 0.95 | ✓ |
-| 7.00 | 6.06 | 5.18 | 745 | 0.402 | 50.1 | 0.64 | ✓ |
-| 7.25 | 5.86 | 4.94 | 747 | 0.405 | 45.7 | 0.58 | ✓ (peak $C_P$) |
-| **9.00** | 4.76 | 3.52 | 753 | 0.326 | 19.7 | 0.25 | ✓ |
+| $\gamma$ | $U_{\text{tunnel}}$ [m/s] | $U'_\infty$ [m/s] | $\lambda$ | rpm | $P$ [W] | $Q$ [Nm] |
+|----:|----:|----:|----:|----:|----:|----:|
+| $0^\circ$ | 4.0 | 5.02 | 8.52 | 751 | 25.4 | 0.32 |
+| $0^\circ$ | 4.5 | 5.41 | 7.88 | 749 | 34.5 | 0.44 |
+| $0^\circ$ | 5.0 | 5.83 | 7.29 | 746 | 44.8 | 0.57 |
+| $0^\circ$ | 5.5 | 6.26 | 6.76 | 744 | 54.9 | 0.70 |
+| $0^\circ$ | 6.0 | 6.68 | 6.31 | 740 | 65.0 | 0.84 |
 
-All retained points satisfy **every** Group-2 limit (power, torque, rpm ≤ 753, $Re = 75\,000$).
+The $\pm30^\circ$ curves use $4.5\text{–}6.5\ \mathrm{m/s}$ (5 points each), with $\lambda$
+running $\approx 8.8 \to 6.15$ and lower loads (yaw cuts power and thrust). All 15 rows satisfy
+**every** Group-2 limit (power ≤ 75 W, torque ≤ 1 Nm, rpm ≤ 753, TSR in $[6.15, 8.79]
+\subset [5.5, 9]$, $Re = 75\,000$ exactly) and are ordered by requested wind speed, then yaw.
 
-**Yaw dependence.** The feasibility band above is evaluated at $\gamma = 0$, the **binding**
-case: yaw reduces both power and torque (§7.9), so the $+30^\circ$ and $-30^\circ$ curves lie
-below the zero-yaw curve and clear the limits with additional margin. The three curves are
-distinct — and $+30^\circ \neq -30^\circ$ — through the cosine-loss and advance-ratio terms
-of §7.9 (e.g. at $\lambda = 7.05$, $C_P = 0.406 / 0.266 / 0.262$ for
-$\gamma = 0^\circ / +30^\circ / -30^\circ$).
+**Why the TSR differs per yaw at the same speed.** Because $Re$ is fixed and the yaw-dependent
+blockage changes $U'_\infty$ (a yawed rotor produces less thrust → less blockage → lower
+$U'_\infty$ for the same tunnel speed), the TSR that hits $Re = 75\,000$ is higher for the
+yawed cases. Each yaw still produces a full $C_P(\lambda)$ curve over a similar $\lambda$ range
+($\approx 6.2\text{–}8.8$) bracketing the optimum (7.05); the curves differ — and
+$+30^\circ \neq -30^\circ$ — through the cosine-loss and advance-ratio terms of §7.9.
 
-### 8.2 Task 2 — Wake (70 points)
+### 8.2 Task 2 — Wake (69 points)
 
-**Goal:** wake shape at one station for $\gamma = 0^\circ, +30^\circ, -30^\circ$, at the
-prescribed $U_\infty = 5.4\ \mathrm{m/s}$, optimum pitch and **optimum** TSR ($\lambda = 7.05$).
+**Goal:** the wake shape on a $y$–$z$ **plane** at one station for $\gamma = 0^\circ,
++30^\circ, -30^\circ$, at the prescribed **requested tunnel speed** $U_\mathrm{tunnel} =
+5.4\ \mathrm{m/s}$, optimum pitch and **optimum** TSR ($\lambda = 7.05$).
 
-**Layout:**
+**Choosing the station ($X = 2D$).** The modeled wake half-width $r_w = R + k_d x$ grows
+downstream, while the traverse reaches only $+600/-700\ \mathrm{mm}$ vertically about hub
+($\pm1000\ \mathrm{mm}$ laterally). At $X = 2D = 2200\ \mathrm{mm}$ behind the rotor the wake
+($r_w \approx 698\ \mathrm{mm}$) is developed yet still nearly fits the vertical traverse
+range — a balance between “capture the whole wake” and “stay clear of the walls”. In the
+traverse frame the home ($X=Y=Z=0$) is $0.5D = 550\ \mathrm{mm}$ behind the rotor, so the
+station is at **traverse $X = 2200 - 550 = 1650\ \mathrm{mm}$** (matching the Lecture-5
+example for “$X = 2D$”).
 
-* Single downstream station $X = 3D = 3262\ \mathrm{mm}$ (within the $3850\ \mathrm{mm}$ limit).
-* Hub height $Z = 0$ throughout.
-* 70 points split **24 / 23 / 23** across the three yaw cases.
-* Per yaw, a cosine-clustered $Y$-line centered on the Jiménez wake center:
+**Layout (per yaw, 23 points = 9 + 6 + 8):**
 
-| Yaw | Wake center $Y$ | $Y$ span (clipped to ±1000 mm) |
-|----:|----:|:--|
-| $0^\circ$ | 0 mm | symmetric $\pm1000$ mm |
-| $+30^\circ$ | $+338$ mm | $-324 \ldots +1000$ mm |
-| $-30^\circ$ | $-338$ mm | $-1000 \ldots +324$ mm |
+* **Hub-height line** ($Z = 0$): 9 points, cosine-clustered in $Y$ about the wake center —
+  the lateral deficit profile that calibrates the wake-center model.
+* **Concentric circles**: rings of 6 and 8 points (equal-area radii) centred on the wake
+  center, out to $0.85 \times r_{\text{reach}}$ ($\approx 510\ \mathrm{mm}$ here, capped by the
+  $+600\ \mathrm{mm}$ vertical reach) — real in-plane samples to validate / graph the 2-D
+  wake. Ring angles are half-step-offset so no circle point lands on $Z = 0$ (no duplication
+  of the hub line).
 
-Note the wake Reynolds number at the fixed $5.4\ \mathrm{m/s}$ is $\approx 67\,300$ (reported,
-not forced — the wake task fixes speed, not $Re$). The reported $C_P$, $C_T$ and loads carry
-the yaw correction of §7.9, so they differ between the three yaw cases (and between
-$+30^\circ$ and $-30^\circ$).
+Total $3 \times 23 = 69$ points (the assignment's 70 reduced to a clean 23/yaw). The per-yaw
+wake center, bounds and operating Reynolds number are:
+
+| Yaw | Wake center $Y$ | $Y$ range [mm] | $Z$ range [mm] | $U'_\infty$ [m/s] | $Re$ |
+|----:|----:|:--|:--|----:|----:|
+| $0^\circ$ | 0 mm | $-837 \ldots +837$ | $-471 \ldots +471$ | 6.23 | 77 700 |
+| $+30^\circ$ | $+185$ mm | $-507 \ldots +878$ | $-471 \ldots +471$ | 5.75 | 71 700 |
+| $-30^\circ$ | $-183$ mm | $-877 \ldots +512$ | $-471 \ldots +471$ | 5.74 | 71 500 |
+
+All points stay strictly inside the traverse window. The equivalent free-air speed (and hence
+$Re$ and the loads) varies with yaw through the blockage correction (§7.10); $Re$ is reported,
+not forced (the wake task fixes the speed). The reported $C_P$, $C_T$ and loads carry the yaw
+correction of §7.9 and so differ across the three yaw cases (and between $+30^\circ$ and
+$-30^\circ$).
+
+**Traverse input file.** The same 69 positions are also written to
+`Task2_Wake_TraversePositions_Group2.txt`, a TAB-separated file with header `x  y  z  A`
+(mm, mm, mm, deg), one line per point in matrix order, where $A$ is the turntable yaw for the
+block (Lecture-5 input format).
 
 ### 8.3 Reference Frame
 
-Per the assignment: origin at the **hub center**, **$X$** downwind, **$Z$** downward, **$Y$**
-the lateral horizontal axis. Probe positions are reported in millimetres in this hub-centered
-frame.
+Probe positions are reported in the **Lecture-5 traverse frame**: the home position
+$X=Y=Z=0$ sits at **hub height, $0.5D$ ($=550\ \mathrm{mm}$) behind the rotor**, with **$X$**
+growing downwind, **$Y$** the lateral horizontal axis and **$Z$** vertical (both sharing their
+origin with the rotor/hub center). Hence the reported $X = X_{\text{behind rotor}} - 550\
+\mathrm{mm}$, while $Y$ and $Z$ are the lateral / vertical offsets from the hub. Positions are
+in millimetres; the turntable yaw $A$ is recorded per block.
 
 ### 8.4 Column Schema
 
@@ -763,7 +840,7 @@ Both matrices share a common block; Task 2 adds three probe-position columns. Tr
 
 | # | Column | Both / Task 2 | Meaning |
 |--:|--------|:--:|---------|
-| 1 | Test number | both | Row index (1…30 / 1…70) |
+| 1 | Test number | both | Row index (1…15 / 1…69) |
 | 2 | Requested wind speed [m/s] | both | Blockage-corrected **tunnel** command speed $U_{\text{tunnel}}$ |
 | 3 | Equivalent free-air U′ [m/s] | both | Speed the rotor feels $U'_\infty$ |
 | 4 | Blade pitch [deg] | both | Collective pitch $\beta$ |
@@ -773,7 +850,7 @@ Both matrices share a common block; Task 2 adds three probe-position columns. Tr
 | 8 | TSR [-] | both | $\lambda$ |
 | 9 | Expected C_P [-] | both | From table |
 | 10 | Expected C_T (thrust) [-] | both | From table (`Cf`) |
-| 11–13 | Wake Probe X / Y / Z [mm] | **Task 2** | Hub-centered probe position |
+| 11–13 | Traverse X / Y / Z [mm] | **Task 2** | Probe position in the traverse frame (§8.3) |
 | — | Expected Power / Torque / Thrust | both | Derived loads (constraint check) |
 | — | Meas. … (15 columns) | both | Blank G1 channel columns |
 
@@ -836,17 +913,23 @@ as physically expected for a fixed rotation direction.
    G1 in this section; the Glauert correction is applied and both $U'_\infty$ and
    $U_{\text{tunnel}}$ are reported, but wake-task results in particular should be read with
    the elevated blockage in mind.
-2. **Constant-$Re$ vs. wind-speed-step guidance.** Task 1 prioritises $Re = 75\,000$ exactly;
-   the “avoid wind-speed changes < 0.5 m/s” hint is treated as guidance, not a hard limit.
-   With 10 mandated points the calibrated speed steps are $\sim$0.25 m/s.
+2. **Stepped tunnel speed (Task 1).** The requested speed is quantised to the tunnel's
+   $0.5\ \mathrm{m/s}$ resolution and the TSR is re-solved per step to hold $Re = 75\,000$.
+   Only ~5 steps per yaw are feasible (15 rows total, ≤ 30). A consequence of fixing *both*
+   $Re$ and the speed grid is that the TSR at a given speed differs slightly across yaws (via
+   the yaw-dependent blockage); each yaw still spans a full $C_P(\lambda)$ curve.
 3. **Representative-section $a'$.** The angular induction at mid-span is derived from the
    tabulated torque coefficient via a representative-section reduction; it is small
    ($\sim10^{-3}$) and does not materially affect $v_{\text{rel}}$.
 4. **Rigid-performance scaling.** Only geometric + TSR similarity are enforced; Lock-number
    and aeroelastic similarity are out of scope.
-5. **Jiménez wake model.** A steady analytical deflection model with $k_d = 0.07$;
-   it predicts the **lateral center**, not the full kidney-shaped deficit. Atmospheric
-   stability and turbulence effects on deflection are not modelled.
+5. **Jiménez wake model & traverse reach.** A steady analytical deflection model with
+   $k_d = 0.07$; it predicts the **lateral center**, not the full kidney-shaped deficit, and
+   atmospheric stability / turbulence effects on deflection are not modelled. The modeled
+   wake ($r_w \approx 698\ \mathrm{mm}$ at $2D$) is larger than the $+600\ \mathrm{mm}$
+   vertical traverse reach, so the concentric circles capture the wake **core** (to ~510 mm
+   radius) while the hub-height line captures the full lateral width; the upper wake edge is
+   not physically reachable by the traverse.
 6. **Yaw performance model.** The cosine-loss exponents ($p_P = 3$, $p_T = 2$) follow from
    momentum theory; the rotational-asymmetry sensitivity $k_\gamma$ is a modelling parameter
    whose sign and magnitude should be calibrated against the measured yaw sweep
@@ -857,6 +940,10 @@ as physically expected for a fixed rotation direction.
 8. **Reference conditions fixed.** Density and viscosity are evaluated at 20 °C / 1 atm; for
    high-accuracy post-processing, recompute $\rho$ from the measured ambient
    temperature/pressure/humidity (Lecture 5).
+9. **Wake-task Reynolds varies with yaw.** Task 2 fixes the *tunnel* speed (5.4 m/s), so the
+   equivalent free-air speed — and the reported Reynolds number ($\approx 71\,500$ at
+   $\pm30^\circ$ up to $\approx 77\,700$ at $0^\circ$) — varies with yaw through the blockage
+   correction. $Re$ is reported, not targeted, for the wake task.
 
 ---
 
@@ -883,7 +970,7 @@ as physically expected for a fixed rotation direction.
 | $U'_\infty$ | Equivalent free-air wind speed | m/s |
 | $U_\perp$ | Rotor-normal wind component $U_\infty\cos\gamma$ | m/s |
 | $v_{\text{rel}}$ | Relative velocity at blade section | m/s |
-| $X, Y, Z$ | Probe position (hub-centered: $X$ downwind, $Z$ down) | mm |
+| $X, Y, Z$ | Probe position (traverse frame: home at hub height, $0.5D$ behind rotor; $X$ downwind) | mm |
 | $\alpha$ | Blockage ratio $A_R/A_{\text{tunnel}}$ | – |
 | $\beta$ | Collective blade pitch | deg |
 | $\gamma$ | Yaw misalignment | deg |
