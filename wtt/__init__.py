@@ -15,6 +15,7 @@ from .reynolds_calibration import ReynoldsCalibrator
 from .task1_builder import Task1PerformanceBuilder
 from .task2_builder import Task2WakeBuilder
 from .excel_writer import TestMatrixExcelWriter
+from .traverse_writer import TraversePositionWriter
 
 __all__ = [
     "AirProperties",
@@ -26,4 +27,5 @@ __all__ = [
     "Task1PerformanceBuilder",
     "Task2WakeBuilder",
     "TestMatrixExcelWriter",
+    "TraversePositionWriter",
 ]

@@ -34,9 +34,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+from scipy.optimize import brentq
+
 from .aerodynamics import omega_from_tsr, rpm_from_omega
 from .air_properties import AirProperties
-from .blockage import blockage_ratio, commanded_tunnel_speed
+from .blockage import (
+    blockage_ratio,
+    commanded_tunnel_speed,
+    equivalent_free_air_speed,
+)
 from .lookup_table import G1LookUpTable
 from .performance import (
     aerodynamic_power,
@@ -178,6 +184,49 @@ class OperatingPointSolver:
         )
 
     # ----------------------------------------------------------------------
+    # Performance task with a prescribed (settable) tunnel command speed
+    # ----------------------------------------------------------------------
+    def solve_for_target_reynolds_at_tunnel_speed(
+        self,
+        requested_tunnel_speed: float,
+        pitch_deg: float,
+        yaw_deg: float,
+        target_reynolds: float,
+        tsr_search_min: float,
+        tsr_search_max: float,
+    ) -> OperatingPointResult:
+        """
+        Constant-Reynolds operating point with a PRESCRIBED tunnel command speed.
+
+        Task-1 path: the operator can only set the tunnel speed in finite (0.5 m/s)
+        steps, so we pick the requested speed and find the TSR whose constant-Re
+        operating point is commanded at exactly that speed. The commanded speed
+        decreases monotonically with TSR (at fixed Re), so the residual has a single
+        root, found with a bracketed solver over [tsr_search_min, tsr_search_max].
+        No fallback: if the requested speed is not achievable inside the TSR band
+        the bracket has no sign change and the solver raises.
+        """
+
+        def residual(tsr: float) -> float:
+            return (
+                self.solve_for_target_reynolds(
+                    tsr=tsr,
+                    pitch_deg=pitch_deg,
+                    yaw_deg=yaw_deg,
+                    target_reynolds=target_reynolds,
+                ).requested_tunnel_speed
+                - requested_tunnel_speed
+            )
+
+        tsr = brentq(residual, tsr_search_min, tsr_search_max)
+        return self.solve_for_target_reynolds(
+            tsr=tsr,
+            pitch_deg=pitch_deg,
+            yaw_deg=yaw_deg,
+            target_reynolds=target_reynolds,
+        )
+
+    # ----------------------------------------------------------------------
     # Wake task: free-air speed is prescribed (5.4 m/s)
     # ----------------------------------------------------------------------
     def solve_for_fixed_speed(
@@ -204,6 +253,41 @@ class OperatingPointSolver:
             ct_thrust=ct_thrust,
             axial=axial,
             tangential=tangential,
+        )
+
+    # ----------------------------------------------------------------------
+    # Wake task with a prescribed (settable) tunnel command speed
+    # ----------------------------------------------------------------------
+    def solve_for_fixed_tunnel_speed(
+        self,
+        tsr: float,
+        pitch_deg: float,
+        yaw_deg: float,
+        requested_tunnel_speed: float,
+    ) -> OperatingPointResult:
+        """
+        Operating point where the TUNNEL command speed is prescribed (Task-2 path).
+
+        The wake task SETS the tunnel speed (5.4 m/s). The equivalent free-air speed
+        the rotor feels is HIGHER (the walls accelerate the flow), so we invert the
+        Glauert correction to recover U'_inf and then run the standard fixed-speed
+        chain. The reported Reynolds number follows from U'_inf (it is not forced to
+        75000). The thrust coefficient used to invert the blockage is the same
+        yaw-corrected value the assembly uses, so the commanded speed comes back out
+        of the chain exactly equal to `requested_tunnel_speed`.
+        """
+        cp_base, ct_base, _axial, _tangential = self._coefficients(tsr, pitch_deg)
+        _cp, ct_thrust = self._apply_yaw(cp_base, ct_base, yaw_deg, tsr)
+        free_air_speed = equivalent_free_air_speed(
+            commanded_tunnel_speed_value=requested_tunnel_speed,
+            thrust_coefficient=ct_thrust,
+            blockage_ratio_value=self._blockage,
+        )
+        return self.solve_for_fixed_speed(
+            tsr=tsr,
+            pitch_deg=pitch_deg,
+            yaw_deg=yaw_deg,
+            free_air_speed=free_air_speed,
         )
 
     # ----------------------------------------------------------------------

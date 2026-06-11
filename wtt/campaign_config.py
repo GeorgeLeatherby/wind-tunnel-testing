@@ -60,13 +60,33 @@ class Group2Constraints:
 
 @dataclass(frozen=True)
 class WakeSurveySettings:
-    """Settings for the Task-2 wake survey (hub-height horizontal line)."""
+    """
+    Settings for the Task-2 wake survey (a y-z measurement plane at one X).
 
-    free_stream_speed: float  # [m/s]   prescribed wind speed for the wake task (5.4)
-    downstream_distance: float  # [m]    single streamwise station X
+    The survey spans a vertical plane at a single downstream station. Per yaw the
+    points are a mix of (a) concentric circles centred on the deflected wake
+    centre - for 2-D validation of the wake shape - and (b) extra points along the
+    hub-height horizontal line (Z = 0) - for calibrating the wake-centre model.
+
+    Coordinate convention (Lecture 5 traversing system): the reported probe
+    positions are in the *traverse* frame whose origin (home, X=Y=Z=0) sits at hub
+    height, `traverse_home_offset` behind the rotor, with X growing downwind. The
+    nominal rotor diameter (1D = 1.1 m) is the traverse/grid convention used to
+    place the station and the home offset; the aerodynamic diameter (from the
+    look-up table) drives the wake-deflection physics.
+    """
+
+    requested_tunnel_speed: float  # [m/s]  speed SET on the tunnel for the wake task (5.4)
+    nominal_rotor_diameter: float  # [m]    traverse/grid convention: 1D = 1.1 m
+    downstream_distance: float  # [m]       streamwise station X behind the rotor
+    traverse_home_offset: float  # [m]      home position distance behind the rotor (0.5D)
     wake_expansion_coefficient: float  # [-] Jimenez k_d
-    total_points: int  # [-]            total wake measurement points (70)
-    # Traverse limits of the wake probe (from the lecture), in metres.
+    # y-z grid per yaw = hubline_points (on Z = 0) + sum(circle_rings_points).
+    hubline_points: int  # [-]             hub-line points (odd -> includes the centre)
+    circle_rings_points: tuple[int, ...]  # [-] points per concentric ring (inner->outer)
+    measuring_area_fraction: float  # [-]  fraction of the reachable extent actually used
+    hubline_span_factor: float  # [-]      hub-line half-width as a multiple of the wake radius
+    # Traverse limits of the wake probe (from Lecture 5), in metres.
     x_min: float
     x_max: float
     y_min: float
@@ -112,15 +132,18 @@ class CampaignConfig:
     yaw_model: YawModelSettings
     lookup_table_path: str
     rotor_diameter: float  # [m]  G1 rotor diameter (derived from the lookup geometry)
-    performance_points_per_yaw: int  # [-] number of TSR points per yaw in Task 1
-    # Feasible TSR band actually swept in Task 1. This is narrower than the raw
-    # [tsr_min, tsr_max] limit band: at constant Re = 75000 the calibrated wind
-    # speed (and therefore power ~ U^3 and torque) grows towards low TSR, so the
-    # lowest part of the allowed band would exceed the 75 W / 1 Nm limits. The
-    # band below was chosen and verified so every swept point stays inside ALL
-    # Group-2 limits while still bracketing the optimum TSR (7.05).
-    performance_tsr_sweep_min: float  # [-]
-    performance_tsr_sweep_max: float  # [-]
+    # Task 1 is driven by the REQUESTED (tunnel) wind speed, which the operator can
+    # only set in finite steps. For every yaw we step the tunnel speed by
+    # `performance_speed_step` (0.5 m/s) across the achievable constant-Reynolds
+    # range and, for each speed, re-solve the TSR that keeps Re = 75000. The TSR
+    # root is bracketed by the verified-feasible band below: it is narrower than
+    # the raw [tsr_min, tsr_max] limit band because at constant Re = 75000 the
+    # calibrated speed (and so power ~ U^3 and torque) grows towards low TSR and
+    # the lowest TSRs would exceed the 75 W / 1 Nm limits. Keeping the bracket in
+    # [6.0, 9.0] guarantees every generated row respects ALL Group-2 limits.
+    performance_tsr_feasible_min: float  # [-]
+    performance_tsr_feasible_max: float  # [-]
+    performance_speed_step: float  # [m/s]
 
 
 def build_group2_campaign(
@@ -154,10 +177,17 @@ def build_group2_campaign(
             reynolds_tolerance=2000.0,
         ),
         wake=WakeSurveySettings(
-            free_stream_speed=5.4,  # [m/s] prescribed for Group 2 wake task
-            downstream_distance=3.0 * rotor_diameter,  # X = 3D
+            requested_tunnel_speed=5.4,  # [m/s] speed set on the tunnel (Group-2 brief)
+            nominal_rotor_diameter=1.1,  # [m]   traverse/grid convention: 1D = 1100 mm
+            downstream_distance=2.0 * 1.1,  # [m] station X = 2D behind the rotor
+            traverse_home_offset=0.5 * 1.1,  # [m] home is 0.5D behind the rotor
             wake_expansion_coefficient=0.07,
-            total_points=70,
+            # y-z grid per yaw: 9 hub-line points + rings of 6 and 8 = 23 points,
+            # i.e. 3 x 23 = 69 points total.
+            hubline_points=9,
+            circle_rings_points=(6, 8),
+            measuring_area_fraction=0.85,  # keep ~15% margin to the traverse limits
+            hubline_span_factor=1.2,  # hub line reaches ~1.2 wake radii either side
             # Traverse limits from Lecture 5 (converted mm -> m).
             x_min=0.0,
             x_max=3.850,
@@ -181,9 +211,11 @@ def build_group2_campaign(
         ),
         lookup_table_path=lookup_table_path,
         rotor_diameter=rotor_diameter,
-        performance_points_per_yaw=10,
-        # Verified feasible band (see comment on the field above): power, torque,
-        # rotor speed and Re = 75000 all satisfied across [6.0, 9.0].
-        performance_tsr_sweep_min=6.0,
-        performance_tsr_sweep_max=9.0,
+        # Verified-feasible TSR bracket for the Task-1 speed sweep: power, torque,
+        # rotor speed and Re = 75000 are all satisfied across [6.0, 9.0], which
+        # brackets the optimum TSR (7.05). The 0.5 m/s step matches the tunnel's
+        # speed-setting resolution.
+        performance_tsr_feasible_min=6.0,
+        performance_tsr_feasible_max=9.0,
+        performance_speed_step=0.5,
     )

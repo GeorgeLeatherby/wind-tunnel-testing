@@ -8,13 +8,16 @@ distribute them *around the expected wake center*, which shifts in the Y
 (lateral) direction depending on the yaw angle and the downstream distance.
 
 We use the classical Jimenez (2010) analytical wake-deflection model to predict
-the lateral position of the wake center, and then build a hub-height line of Y
-positions that is denser near that center and sparser towards the edges (the
-paper shows the wake center is best resolved when points straddle it).
+the lateral position of the wake center, and then build a measurement plane
+around it: concentric circles centred on the wake center (for 2-D wake-shape
+validation) plus a denser hub-height line of Y positions (for calibrating the
+wake-center model). Cosine clustering keeps points dense where the deficit
+gradient is steepest.
 
-Reference frame (assignment): X is the downwind direction, Z points downwards,
-origin at the hub center. Y is the remaining (lateral) horizontal axis. Wake
-measurements are limited to hub height, i.e. Z = 0.
+Reference frame: X is the downwind direction, Z is vertical and Y is the lateral
+horizontal axis, with the origin at the hub center (matching the traverse frame
+once the streamwise home offset is applied). The circle radii are sized to the
+reachable traverse window so no point is clipped.
 
 Each formula is its own function.
 """
@@ -110,29 +113,69 @@ def clip_to_limits(values: np.ndarray, lower: float, upper: float) -> np.ndarray
     return np.clip(values, lower, upper)
 
 
-def fitted_half_width(
-    wake_center_y: float,
-    desired_half_width: float,
-    lower_limit: float,
-    upper_limit: float,
+def reachable_radius(
+    center_y: float,
+    center_z: float,
+    y_min: float,
+    y_max: float,
+    z_min: float,
+    z_max: float,
 ) -> float:
     """
-    Largest symmetric half-width around `wake_center_y` that still fits the limits.
+    Largest circle radius around (center_y, center_z) that fits the traverse window.
 
-    The survey line is symmetric about the wake center, so the usable half-width
-    is bounded by the nearer traverse wall:
+    The probe can move inside the rectangle [y_min, y_max] x [z_min, z_max]; the
+    biggest centred circle is bounded by the nearest wall:
 
-        available = min(center - lower_limit, upper_limit - center)
+        r = min(center_y - y_min, y_max - center_y,
+                center_z - z_min, z_max - center_z)
 
-    The returned value is min(desired_half_width, available), which guarantees the
-    extreme points land exactly on (not beyond) the traverse limits, so no point
-    has to be clipped and the cosine clustering is preserved. Raises if the center
-    itself lies outside the limits (that would be a configuration error).
+    Raises if the centre lies outside the window (a configuration error).
     """
-    if not (lower_limit <= wake_center_y <= upper_limit):
+    if not (y_min <= center_y <= y_max and z_min <= center_z <= z_max):
         raise ValueError(
-            f"Wake center {wake_center_y:.3f} m lies outside the traverse "
-            f"limits [{lower_limit}, {upper_limit}] m."
+            f"Wake centre ({center_y:.3f}, {center_z:.3f}) m lies outside the "
+            f"traverse window [{y_min}, {y_max}] x [{z_min}, {z_max}] m."
         )
-    available = min(wake_center_y - lower_limit, upper_limit - wake_center_y)
-    return min(desired_half_width, available)
+    return min(
+        center_y - y_min,
+        y_max - center_y,
+        center_z - z_min,
+        z_max - center_z,
+    )
+
+
+def concentric_ring_positions(
+    center_y: float,
+    center_z: float,
+    max_radius: float,
+    points_per_ring: tuple[int, ...],
+) -> list[tuple[float, float]]:
+    """
+    (Y, Z) points on concentric circles centred on the wake centre.
+
+    `points_per_ring` gives the number of points on each ring from the innermost
+    to the outermost; its length is the number of rings. Ring radii use
+    equal-AREA spacing
+
+        r_i = max_radius * sqrt(i / n_rings),   i = 1 .. n_rings
+
+    so the rings sample the disk roughly uniformly per unit area. Each ring's
+    points are spread evenly in angle with a half-step offset, which keeps every
+    point off the Z = 0 axis (so the rings never duplicate the hub-height line
+    points). Use an even number of points per ring to guarantee this.
+    """
+    n_rings = len(points_per_ring)
+    if n_rings < 1:
+        raise ValueError("Need at least one ring.")
+    positions: list[tuple[float, float]] = []
+    for ring_index, point_count in enumerate(points_per_ring, start=1):
+        if point_count < 1:
+            raise ValueError("Each ring needs at least one point.")
+        radius = max_radius * math.sqrt(ring_index / n_rings)
+        for k in range(point_count):
+            angle = (k + 0.5) * 2.0 * math.pi / point_count
+            y = center_y + radius * math.cos(angle)
+            z = center_z + radius * math.sin(angle)
+            positions.append((y, z))
+    return positions
