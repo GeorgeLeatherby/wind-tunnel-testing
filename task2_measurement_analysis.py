@@ -1,18 +1,27 @@
 """
+The experiment where the data originates from was conducted with a model wind turbine in a wind tunnel. 3 different yaw angles were tested: 
+-30°, 0°, +30°. The measurement data was recorded in matlab .mat files. Each yaw angle has its own .mat file. The data was collected at a
+sampling frequency of 10 kHz for a duration of 10 seconds. The data for each yaw angle was collected at 23 different measurement points in the wind tunnel
+using the same sensors on a traversing system. The data was collected in the form of time series.
+
 This file aims at reading in the measurement data files in matlab .mat format.
-There is an individual .mat file per yaw angle.
 
 General Processing Steps:
 1. Read in the .mat files for each yaw angle.
 2. Extract the relevant measurement data from each file.
-3. Process the raw extracted data (time series, frequency domain, statistical distribution, etc
+3. Process the raw extracted data (time series, frequency domain, statistical distribution, etc.)
     to derive meaningful metrics for further calculation
 4. Store the processed data in a structured format for further analysis and visualization.
 5. Generate a wake map for each yaw angle based on the processed data.
 
 """
 
+# imports
 import mat73
+import numpy as np
+from scipy.signal import welch, find_peaks
+import matplotlib.pyplot as plt
+
 
 class MatFilereader:
     """
@@ -64,7 +73,9 @@ class DataProcessor:
         rawdata (dict): A dictionary containing raw measurement data for each yaw angle.
         """
         self.rawdata = rawdata
-        self.processed_data = {}
+        self.processed_data = {} # A top-level dictionary to store processed data for each yaw angle
+        self.sampling_frequency = 10000  # Sampling frequency (in Hz) for the time series data
+        self.measuremnt_duration = 10  # Duration (in seconds) of the measurement data
         self.data_processing()  # Call the data processing method upon initialization
 
     def data_processing(self):
@@ -76,7 +87,86 @@ class DataProcessor:
 
         The processed data is stored in a structured format for further analysis and visualization.
         """
-        # Amplitude Domain Analysis
+        # Fill processed_data dictionary with yaw angle keys and empty dictionaries as values
+        for file_path in self.rawdata.keys():
+            yaw_angle = file_path.split('_')[-1].split('.')[0]  # Extract yaw angle from file path
+            self.processed_data[yaw_angle] = {}  # Initialize an empty dictionary for each yaw angle
+
+        # Top loop files
+        for file_path, mat_data in self.rawdata.items():
+            resultscell = mat_data['resultscell']
+            # Dict init containing empty dicts under each measurement point key (00 to 22) for each yaw angle
+            yaw_angle = file_path.split('_')[-1].split('.')[0]  # Extract yaw angle from file path
+            self.processed_data[yaw_angle] = {f"{i:02d}": {} for i in range(23)}  # Initialize empty dicts for each measurement point (00 to 22)
+
+            # Secondary loop trough the 23 measurement points (00 to 22)
+            for measurement_point in resultscell:
+                processed_metrics = {}  # Initialize a dict to store processed metrics for the current measurement point
+                # Extract the relevant ndarrays (02 to 07) for processing
+                angle_data = measurement_point[1][2]        # Assuming 02 is at index 2
+                mach_data = measurement_point[1][4]         # Assuming 04 is at index 4
+                velocity_data = measurement_point[1][5]     # Assuming 05 is at index 5
+                p_t_data = measurement_point[1][6]          # Assuming 06 is at index 6
+                p_s_data = measurement_point[1][7]          # Assuming 07 is at index 7
+
+                # Third loop through the extracted ndarrays which contain time-series informationfor processing
+                for data_array in [angle_data, mach_data, velocity_data, p_t_data, p_s_data]:
+                    
+                    # Perform amplitude domain analysis on all arrays (mean, median, standard deviation, min, max)
+                    mean_value = data_array.mean()
+                    median_value = np.median(data_array)
+                    std_dev = data_array.std()
+                    min_value = data_array.min()
+                    max_value = data_array.max()
+                    rms_value = np.sqrt(np.mean(data_array**2))  # Root Mean Square (RMS) value
+
+                    # Assign name to the processed metrics based on the data array being processed
+                    if np.array_equal(data_array, angle_data):
+                        metric_name = 'Angle'
+                    elif np.array_equal(data_array, mach_data):
+                        metric_name = 'Mach'
+                    elif np.array_equal(data_array, velocity_data):
+                        metric_name = 'Velocity'
+                    elif np.array_equal(data_array, p_t_data):
+                        metric_name = 'p_t'
+                    elif np.array_equal(data_array, p_s_data):
+                        metric_name = 'p_s'
+
+                    # Perform Fast Fourier Transform (FFT) for frequency domain analysis
+                    nyquist_freq = self.sampling_frequency / 2
+                    n_samples = len(data_array)
+                    fft_result = np.fft.fft(data_array)
+                    f = np.linspace(-nyquist_freq, nyquist_freq, n_samples)
+                    f = np.fft.fftshift(f)  # Shift the zero frequency component to the center of the spectrum
+                    x = 2 * fft_result / n_samples  # Normalize the FFT result
+
+                    # Perform Power Spectral Density (PSD) analysis
+                    psd_result = np.abs(x) ** 2 / 2 / np.diff(f)[0]  # Compute the Power Spectral Density
+
+                    # Welch method for Power Spectral Density estimation
+                    f_welch, psd_welch = welch(data_array, fs=self.sampling_frequency, nperseg=1024)
+
+                    peak_signals, properties = find_peaks(psd_welch, height=np.max(psd_welch) * 0.1)  # Find peaks in the PSD
+
+                    # Store the processed metrics in a structured format
+                    processed_metrics[metric_name] = {
+                        'mean': mean_value,
+                        'median': median_value,
+                        'std_dev': std_dev,
+                        'min': min_value,
+                        'max': max_value,
+                        'rms': rms_value,  # Root Mean Square (RMS) value
+                        'fft': fft_result, # Fast Fourier Transform result
+                        'psd': psd_result,  # Power Spectral Density
+                        'fwelch': f_welch,  # Frequencies for Welch method
+                        'psdwelch': psd_welch,  # Power Spectral Density from Welch method
+                        'peaks': peak_signals,  # Indices of peaks in the PSD
+                        'peak_properties': properties  # Properties of the detected peaks
+                    }
+
+                # add the processed metrics to the corresponding measurement point in the processed_data dictionary
+                measurement_point_key = f"{resultscell.index(measurement_point):02d}"  # Get the measurement point key (00 to 22)
+                self.processed_data[yaw_angle][measurement_point_key] = processed_metrics  # Store the processed metrics for the current measurement point
 
 
         print("Data processing completed. Processed data is ready for further analysis.")
@@ -107,3 +197,4 @@ if __name__ == "__main__":
     mat_reader = MatFilereader(file_paths)
     data_processor = DataProcessor(mat_reader.rawdata)
     wake_map_generator = WakeMapGenerator(data_processor.processed_data)
+    plt.show()
