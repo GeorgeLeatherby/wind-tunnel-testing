@@ -8,7 +8,14 @@ Task1_Performance_TestMatrix_Group2.xlsx
 Task2_Wake_TestMatrix_Group2.xlsx
 ~$Task1_Performance_TestMatrix_Group2.xlsx
 ~$Task2_Wake_TestMatrix_Group2.xlsx
+Task1_Performance_TestMatrix_Group2_measurements.xlsx
+~$Task1_Performance_TestMatrix_Group2_measurements.xlsx
 
+
+*.DAT
+*r32
+*.tdms
+*.tdms_index
 # Third-party / course material — do NOT redistribute
 *.pdf
 LookUpTable_G1.mat
