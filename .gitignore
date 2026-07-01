@@ -246,3 +246,4 @@ measurements/yaw_minus30/Results_transient_17-6-2026_FRAP_group02_yawM30.mat
 measurements/yaw_plus30/Results_transient_17-6-2026_FRAP_group02_yawP30.mat
 
 *.npz
+*.png
