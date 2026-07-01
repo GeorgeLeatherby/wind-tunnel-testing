@@ -1,7 +1,7 @@
 # COPILOT EDITS OPERATIONAL GUIDELINES
 
 ## PRIME DIRECTIVE
-Avoid working on more then one file at a time. Multiple simulataneos edits to a file will cause corruption. 
+Avoid working on more then one file at a time. Multiple simultaneos edits to a file will cause corruption. 
 
 Always explain and teach about what you are doing while coding.
 
@@ -16,6 +16,8 @@ Your plan MUST include:
 ALWAYS add the line number and the filename when you reference code.
 
 Always verify information before presenting it. Do not make assumptions or speculate without clear evidence.
+
+If there is a .venv or virtual environment, always use it when running code. If there is no virtual environment, ask the user if they want to create one before running code.
 
 ## Coding style guidelines
 Use descriptive variable and function names that clearly indicate their purpose. Check if there are existing naming conventions in the codebase and follow them for consistency. 

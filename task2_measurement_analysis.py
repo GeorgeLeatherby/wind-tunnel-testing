@@ -17,11 +17,13 @@ General Processing Steps:
 """
 
 # imports
-import mat73
 import numpy as np
+from scipy.io import loadmat
 from scipy.signal import welch, find_peaks
 import matplotlib.pyplot as plt
 import os
+import mat73
+
 
 
 class MatFilereader:
@@ -41,7 +43,12 @@ class MatFilereader:
         self.rawdata = {}
 
         for file_path in self.file_paths:
-            mat_data = mat73.loadmat(file_path, use_attrdict=True)
+            if mat73 is not None:
+                mat_data = mat73.loadmat(file_path, use_attrdict=True)
+            # else:
+            #     mat_data = loadmat(file_path, squeeze_me=False, struct_as_record=False)
+            else:
+                raise ImportError("mat73 module is not available. Please install it to read .mat files.")
             self.rawdata[file_path] = mat_data
             """
             Description of self.rawdata:
@@ -75,111 +82,347 @@ class DataProcessor:
         """
         self.rawdata = rawdata
         self.processed_data = {} # A top-level dictionary to store processed data for each yaw angle
+        self.quality_assessment = {}
         self.sampling_frequency = 10000  # Sampling frequency (in Hz) for the time series data
         self.measuremnt_duration = 10  # Duration (in seconds) of the measurement data
         self.data_processing()  # Call the data processing method upon initialization
 
+    @staticmethod
+    def _normalize_yaw_label(file_path):
+        """Map a file name to the canonical yaw label used in downstream code."""
+        yaw_name = os.path.basename(file_path)
+        if "yawM30" in yaw_name:
+            return "-30"
+        if "yaw00" in yaw_name or "yaw_00" in yaw_name:
+            return "0"
+        if "yawP30" in yaw_name:
+            return "+30"
+        return os.path.splitext(yaw_name)[0]
+
+    @staticmethod
+    def _ensure_1d_signal(raw_signal, signal_name):
+        """Convert a raw MATLAB payload to a 1D floating-point NumPy array."""
+        signal_array = np.asarray(raw_signal, dtype=float).squeeze()
+        if signal_array.ndim != 1:
+            raise ValueError(
+                f"{signal_name} must resolve to a 1D time series, got shape {signal_array.shape}."
+            )
+        if signal_array.size == 0:
+            raise ValueError(f"{signal_name} time series is empty.")
+        return signal_array
+
+    @staticmethod
+    def _extract_angle_components(angle_raw):
+        """Extract alpha and beta from the Angle payload.
+
+        The institute notes say alpha is stored in column 3 and beta in column 4.
+        This helper accepts either row-major or column-major MATLAB payloads.
+        """
+        angle_array = np.asarray(angle_raw, dtype=float)
+        if angle_array.ndim != 2:
+            raise ValueError(f"Angle payload must be 2D, got shape {angle_array.shape}.")
+
+        if angle_array.shape[1] >= 4:
+            alpha = np.asarray(angle_array[:, 2], dtype=float).squeeze()
+            beta = np.asarray(angle_array[:, 3], dtype=float).squeeze()
+        elif angle_array.shape[0] >= 4:
+            alpha = np.asarray(angle_array[2, :], dtype=float).squeeze()
+            beta = np.asarray(angle_array[3, :], dtype=float).squeeze()
+        else:
+            raise ValueError(
+                f"Angle payload does not contain columns 3 and 4: shape {angle_array.shape}."
+            )
+
+        if alpha.ndim != 1 or beta.ndim != 1:
+            raise ValueError("Alpha and beta must each resolve to 1D time series.")
+        if alpha.size == 0 or beta.size == 0:
+            raise ValueError("Alpha or beta time series is empty.")
+        if alpha.shape != beta.shape:
+            raise ValueError(
+                f"Alpha and beta must have the same length, got {alpha.shape} and {beta.shape}."
+            )
+
+        return alpha, beta
+
+    @staticmethod
+    def _series_status(array_value):
+        """Return shape, NaN flag, and inf flag for any NumPy-compatible value."""
+        array_value = np.asarray(array_value)
+        has_nan = np.issubdtype(array_value.dtype, np.number) and np.isnan(array_value).any()
+        has_inf = np.issubdtype(array_value.dtype, np.number) and np.isinf(array_value).any()
+        return array_value.shape, bool(has_nan), bool(has_inf)
+
+    def _validate_shape(self, yaw_angle, point_idx, series_name, actual_value, expected_shape):
+        """Fail fast when a time-series shape does not match the expected shape."""
+        actual_shape = np.asarray(actual_value).shape
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Shape mismatch at yaw {yaw_angle}, point {point_idx:02d}, series '{series_name}': "
+                f"expected {expected_shape}, got {actual_shape}."
+            )
+
+    @staticmethod
+    def _count_nan(actual_value):
+        """Count NaN values in any numeric NumPy-compatible payload."""
+        arr = np.asarray(actual_value)
+        if not np.issubdtype(arr.dtype, np.number):
+            return 0
+        return int(np.isnan(arr).sum())
+
+    @staticmethod
+    def _count_inf(actual_value):
+        """Count +-inf values in any numeric NumPy-compatible payload."""
+        arr = np.asarray(actual_value)
+        if not np.issubdtype(arr.dtype, np.number):
+            return 0
+        return int(np.isinf(arr).sum())
+
+    def _register_quality_counts(self, yaw_angle, point_idx, nan_before, nan_after, inf_persistent):
+        """Accumulate quality counts per yaw and measurement point."""
+        if yaw_angle not in self.quality_assessment:
+            self.quality_assessment[yaw_angle] = {
+                'nan_before': 0,
+                'nan_after': 0,
+                'inf_persistent': 0,
+                'points': {}
+            }
+
+        point_key = f"{point_idx:02d}"
+        self.quality_assessment[yaw_angle]['points'][point_key] = {
+            'nan_before': int(nan_before),
+            'nan_after': int(nan_after),
+            'inf_persistent': int(inf_persistent),
+        }
+
+        self.quality_assessment[yaw_angle]['nan_before'] += int(nan_before)
+        self.quality_assessment[yaw_angle]['nan_after'] += int(nan_after)
+        self.quality_assessment[yaw_angle]['inf_persistent'] += int(inf_persistent)
+
+    @staticmethod
+    def _max_consecutive_true(mask):
+        """Return the longest run of True values in a boolean mask."""
+        if mask.size == 0:
+            return 0
+        padded = np.concatenate(([False], mask, [False]))
+        changes = np.diff(padded.astype(int))
+        run_starts = np.where(changes == 1)[0]
+        run_ends = np.where(changes == -1)[0]
+        if run_starts.size == 0:
+            return 0
+        return int(np.max(run_ends - run_starts))
+
+    def _interpolate_nans_limited(self, signal_array, yaw_angle, point_idx, series_name, max_consecutive=100):
+        """Linearly interpolate NaNs if each NaN run is within the allowed run length.
+
+        max_consecutive=100 corresponds to 0.01 s at 10 kHz.
+        """
+        interpolated = np.asarray(signal_array, dtype=float).copy()
+        nan_mask = np.isnan(interpolated)
+
+        if not nan_mask.any():
+            return interpolated
+
+        longest_run = self._max_consecutive_true(nan_mask)
+        if longest_run > max_consecutive:
+            raise ValueError(
+                f"Interpolation limit exceeded for {series_name} at yaw {yaw_angle}, point {point_idx:02d}: "
+                f"longest NaN run={longest_run} samples (> {max_consecutive})."
+            )
+
+        valid_idx = np.where(~nan_mask)[0]
+        if valid_idx.size < 2:
+            raise ValueError(
+                f"Not enough valid samples to interpolate {series_name} at yaw {yaw_angle}, point {point_idx:02d}."
+            )
+
+        nan_idx = np.where(nan_mask)[0]
+        interpolated[nan_idx] = np.interp(nan_idx, valid_idx, interpolated[valid_idx])
+        return interpolated
+
+    def _print_quality_assessment(self):
+        """Print only NaN before/after interpolation and persistent inf counts."""
+        print("\n=== Interpolation Quality Summary ===")
+        for yaw_angle in sorted(self.quality_assessment.keys()):
+            yaw_data = self.quality_assessment[yaw_angle]
+            print(
+                f"yaw={yaw_angle}: nan_before={yaw_data['nan_before']}, "
+                f"nan_after={yaw_data['nan_after']}, inf_persistent={yaw_data['inf_persistent']}"
+            )
+
+            for point_key in sorted(yaw_data['points'].keys()):
+                point_data = yaw_data['points'][point_key]
+                print(
+                    f"  point={point_key}: nan_before={point_data['nan_before']}, "
+                    f"nan_after={point_data['nan_after']}, inf_persistent={point_data['inf_persistent']}"
+                )
+
+    def _build_signal_metrics(self, signal_array, yaw_angle=None, point_idx=None, series_name=None):
+        """Calculate statistical and frequency-domain metrics for one time series."""
+        mean_value = signal_array.mean()
+        median_value = np.median(signal_array)
+        std_dev = signal_array.std()
+        min_value = signal_array.min()
+        max_value = signal_array.max()
+        rms_value = np.sqrt(np.mean(signal_array**2))
+
+        nyquist_freq = self.sampling_frequency / 2
+        n_samples = len(signal_array)
+        fft_result = np.fft.fft(signal_array)
+        frequencies = np.linspace(-nyquist_freq, nyquist_freq, n_samples)
+        frequencies = np.fft.fftshift(frequencies)
+        normalized_fft = 2 * fft_result / n_samples
+
+        psd_result = np.abs(normalized_fft) ** 2 / 2 / np.diff(frequencies)[0]
+
+        f_welch, psd_welch = welch(signal_array, fs=self.sampling_frequency, nperseg=1024)
+        peak_signals, properties = find_peaks(psd_welch, height=np.max(psd_welch) * 0.1)
+
+        metrics = {
+            'series': signal_array,
+            'mean': np.array([mean_value]),
+            'median': np.array([median_value]),
+            'std_dev': np.array([std_dev]),
+            'min': np.array([min_value]),
+            'max': np.array([max_value]),
+            'rms': np.array([rms_value]),
+            'fft': fft_result,
+            'psd': psd_result,
+            'fwelch': f_welch,
+            'psdwelch': psd_welch,
+            'peaks': peak_signals,
+            'peak_properties': properties,
+        }
+
+        if yaw_angle is not None and point_idx is not None and series_name is not None:
+            for metric_name in {'mean', 'median', 'std_dev', 'min', 'max', 'rms'}:
+                self._validate_shape(
+                    yaw_angle,
+                    point_idx,
+                    f"{series_name}.{metric_name}",
+                    metrics[metric_name],
+                    (1,),
+                )
+
+        return metrics
+
     def data_processing(self):
         """
-        Processes the raw measurement data from ndarrays 01 to 07 to derive meaningful metrics for further calculation.
-        This method should implement the necessary processing steps (e.g., amplitude domain analysis,
-        frequency domain analysis, statistical distribution analysis) to extract relevant information
-        from the raw data.
+        Processes the raw measurement data to derive the velocity components requested by the
+        wind tunnel institute.
+
+        The calculation uses the Angle payload stored at point_payload[2]. Its columns 3 and 4
+        are interpreted as alpha and beta, together with the measured velocity magnitude. The
+        derived velocity components are calculated as:
+
+        u_uncor = U * cos(alpha) * cos(beta)
+        v_uncor = U * sin(beta)
+        w_uncor = U * sin(alpha) * cos(beta)
+
+        The FRAP probe orientation is then corrected with:
+
+        u_trans = u_uncor
+        v_trans = -w_uncor
+        w_trans = v_uncor
 
         The processed data is stored in a structured format for further analysis and visualization.
         """
-        # Fill processed_data dictionary with yaw angle keys and empty dictionaries as values
-        for file_path in self.rawdata.keys():
-            yaw_angle = file_path.split('_')[-1].split('.')[0]  # Extract yaw angle from file path
-            self.processed_data[yaw_angle] = {}  # Initialize an empty dictionary for each yaw angle
+        self.processed_data = {}
+        self.quality_assessment = {}
 
-        # Top loop files
         for file_path, mat_data in self.rawdata.items():
+            yaw_angle = self._normalize_yaw_label(file_path)
+            self.processed_data[yaw_angle] = {f"{i:02d}": {} for i in range(23)}
             resultscell = mat_data['resultscell']
-            # Dict init containing empty dicts under each measurement point key (00 to 22) for each yaw angle
-            yaw_angle = file_path.split('_')[-1].split('.')[0]  # Extract yaw angle from file path
-            self.processed_data[yaw_angle] = {f"{i:02d}": {} for i in range(23)}  # Initialize empty dicts for each measurement point (00 to 22)
 
-            # Secondary loop trough the 23 measurement points (00 to 22)
             for point_idx, measurement_point in enumerate(resultscell):
-    
-                processed_metrics = {}  # Initialize a dict to store processed metrics for the current measurement point
-                # Extract the relevant ndarrays (02 to 07) for processing
-                #angle_data = measurement_point[1][2]        # Assuming 02 is at index 2
-                mach_data = measurement_point[1][4]         # Assuming 04 is at index 4
-                velocity_data = measurement_point[1][5]     # Assuming 05 is at index 5
-                p_t_data = measurement_point[1][6]          # Assuming 06 is at index 6
-                p_s_data = measurement_point[1][7]          # Assuming 07 is at index 7
-                coordinates = measurement_point[1][10]              # Assuming 10 is at index 10
-                windspeed_windtunnel = measurement_point[1][11]              # Assuming 11 is at index 11
+                point_payload = measurement_point[1]
 
-                # Third loop through the extracted ndarrays which contain time-series informationfor processing
-                # for data_array in [angle_data, mach_data, velocity_data, p_t_data, p_s_data]:
-                for data_array in [mach_data, velocity_data, p_t_data, p_s_data]:
+                time_raw = point_payload[1]
+                angle_raw = point_payload[2]
+                velocity_raw = point_payload[5]
+                coord_raw = point_payload[10]
+                u_wt_raw = point_payload[11]
 
-                    # Perform amplitude domain analysis on all arrays (mean, median, standard deviation, min, max)
-                    mean_value = data_array.mean()
-                    median_value = np.median(data_array)
-                    std_dev = data_array.std()
-                    min_value = data_array.min()
-                    max_value = data_array.max()
-                    rms_value = np.sqrt(np.mean(data_array**2))  # Root Mean Square (RMS) value
+                time_data = self._ensure_1d_signal(time_raw, "time")
+                self._validate_shape(yaw_angle, point_idx, 'time', time_data, (100000,))
+                self._validate_shape(yaw_angle, point_idx, 'angle', angle_raw, (100000, 4))
+                self._validate_shape(yaw_angle, point_idx, 'velocity', velocity_raw, (100000,))
 
-                    # Assign name to the processed metrics based on the data array being processed
-                    #if np.array_equal(data_array, angle_data):
-                        #metric_name = 'Angle'
-                    if np.array_equal(data_array, mach_data):
-                        metric_name = 'Mach'
-                    elif np.array_equal(data_array, velocity_data):
-                        metric_name = 'Velocity'
-                    elif np.array_equal(data_array, p_t_data):
-                        metric_name = 'p_t'
-                    elif np.array_equal(data_array, p_s_data):
-                        metric_name = 'p_s'
+                coord_data = np.asarray(coord_raw, dtype=float).reshape(-1)
+                u_wt_data = np.asarray(u_wt_raw, dtype=float).reshape(-1)
+                self._validate_shape(yaw_angle, point_idx, 'coord', coord_data, (3,))
+                self._validate_shape(yaw_angle, point_idx, 'U_WT', u_wt_data, (1,))
 
-                    # Perform Fast Fourier Transform (FFT) for frequency domain analysis
-                    nyquist_freq = self.sampling_frequency / 2
-                    n_samples = len(data_array)
-                    fft_result = np.fft.fft(data_array)
-                    f = np.linspace(-nyquist_freq, nyquist_freq, n_samples)
-                    f = np.fft.fftshift(f)  # Shift the zero frequency component to the center of the spectrum
-                    x = 2 * fft_result / n_samples  # Normalize the FFT result
+                alpha_data, beta_data = self._extract_angle_components(angle_raw)
+                velocity_data = self._ensure_1d_signal(velocity_raw, "velocity")
 
-                    # Perform Power Spectral Density (PSD) analysis
-                    psd_result = np.abs(x) ** 2 / 2 / np.diff(f)[0]  # Compute the Power Spectral Density
+                nan_before = (
+                    self._count_nan(alpha_data)
+                    + self._count_nan(beta_data)
+                    + self._count_nan(velocity_data)
+                )
 
-                    # Welch method for Power Spectral Density estimation
-                    f_welch, psd_welch = welch(data_array, fs=self.sampling_frequency, nperseg=1024)
+                alpha_data = self._interpolate_nans_limited(alpha_data, yaw_angle, point_idx, 'alpha', max_consecutive=100)
+                beta_data = self._interpolate_nans_limited(beta_data, yaw_angle, point_idx, 'beta', max_consecutive=100)
+                velocity_data = self._interpolate_nans_limited(velocity_data, yaw_angle, point_idx, 'velocity', max_consecutive=100)
 
-                    peak_signals, properties = find_peaks(psd_welch, height=np.max(psd_welch) * 0.1)  # Find peaks in the PSD
+                nan_after = (
+                    self._count_nan(alpha_data)
+                    + self._count_nan(beta_data)
+                    + self._count_nan(velocity_data)
+                )
 
-                    # Store the processed metrics in a structured format
-                    processed_metrics[metric_name] = {
-                        'mean': mean_value,
-                        'median': median_value,
-                        'std_dev': std_dev,
-                        'min': min_value,
-                        'max': max_value,
-                        'rms': rms_value,  # Root Mean Square (RMS) value
-                        'fft': fft_result, # Fast Fourier Transform result
-                        'psd': psd_result,  # Power Spectral Density
-                        'fwelch': f_welch,  # Frequencies for Welch method
-                        'psdwelch': psd_welch,  # Power Spectral Density from Welch method
-                        'peaks': peak_signals,  # Indices of peaks in the PSD
-                        'peak_properties': properties  # Properties of the detected peaks
-                    }
+                self._validate_shape(yaw_angle, point_idx, 'alpha', alpha_data, (100000,))
+                self._validate_shape(yaw_angle, point_idx, 'beta', beta_data, (100000,))
+                self._validate_shape(yaw_angle, point_idx, 'velocity', velocity_data, (100000,))
 
-                # add the processed metrics to the corresponding measurement point in the processed_data dictionary
-                measurement_point_key = f"{point_idx:02d}"  # Get the measurement point key (00 to 22)
-                # Add the coordinates and windspeed prior to turbine to the processed metrics for the current measurement point
-                processed_metrics['coordinates'] = coordinates
-                processed_metrics['windspeed_windtunnel'] = windspeed_windtunnel
-                self.processed_data[yaw_angle][measurement_point_key] = processed_metrics  # Store the processed metrics for the current measurement point
+                if alpha_data.shape != velocity_data.shape or beta_data.shape != velocity_data.shape:
+                    raise ValueError(
+                        f"Shape mismatch at yaw {yaw_angle}, point {point_idx:02d}, series 'alpha/beta/velocity': "
+                        f"alpha={alpha_data.shape}, beta={beta_data.shape}, velocity={velocity_data.shape}."
+                    )
 
-        # Save processed data to a .npz file for later use
-        np.savez("processed_data.npz", **self.processed_data)
+                alpha_rad = np.deg2rad(alpha_data)
+                beta_rad = np.deg2rad(beta_data)
 
-        print("Data processing completed and saved. Processed data is ready for further analysis.")
+                u_uncor = velocity_data * np.cos(alpha_rad) * np.cos(beta_rad)
+                v_uncor = velocity_data * np.sin(beta_rad)
+                w_uncor = velocity_data * np.sin(alpha_rad) * np.cos(beta_rad)
+
+                v_trans = -w_uncor
+                w_trans = v_uncor
+
+                self._validate_shape(yaw_angle, point_idx, 'u_trans', u_uncor, (100000,))
+                self._validate_shape(yaw_angle, point_idx, 'v_trans', v_trans, (100000,))
+                self._validate_shape(yaw_angle, point_idx, 'w_trans', w_trans, (100000,))
+
+                inf_persistent = (
+                    self._count_inf(alpha_data)
+                    + self._count_inf(beta_data)
+                    + self._count_inf(velocity_data)
+                    + self._count_inf(u_uncor)
+                    + self._count_inf(v_trans)
+                    + self._count_inf(w_trans)
+                )
+                self._register_quality_counts(yaw_angle, point_idx, nan_before, nan_after, inf_persistent)
+
+                processed_metrics = {
+                    'time': time_data,
+                    'alpha': self._build_signal_metrics(alpha_data, yaw_angle, point_idx, 'alpha'),
+                    'beta': self._build_signal_metrics(beta_data, yaw_angle, point_idx, 'beta'),
+                    'velocity': self._build_signal_metrics(velocity_data, yaw_angle, point_idx, 'velocity'),
+                    'u_trans': self._build_signal_metrics(u_uncor, yaw_angle, point_idx, 'u_trans'),
+                    'v_trans': self._build_signal_metrics(v_trans, yaw_angle, point_idx, 'v_trans'),
+                    'w_trans': self._build_signal_metrics(w_trans, yaw_angle, point_idx, 'w_trans'),
+                    'coord': coord_data,
+                    'U_WT': u_wt_data,
+                }
+
+                measurement_point_key = f"{point_idx:02d}"
+                self.processed_data[yaw_angle][measurement_point_key] = processed_metrics
+
+        np.savez("processed_data.npz", processed_data=self.processed_data)
+        self._print_quality_assessment()
 
 
 class WakeMapGenerator:
@@ -212,198 +455,20 @@ class WakeMapGenerator:
         if not os.path.exists(self.output_directory):
             os.makedirs(self.output_directory)
 
-    def _extract_metric(self, yaw_angle, feature_name, metric_type):
-        """
-        Strict extractor for specific features and metrics from the nested dictionary.
-        """
-        y_coords = []
-        z_coords = []
-        values = []
 
-        yaw_data = self.processed_data.get(yaw_angle)
-        if yaw_data is None:
-            raise KeyError(f"Yaw angle key '{yaw_angle}' missing from processed data.")
-
-        for point_key, point_data in yaw_data.items():
-            coords = point_data.get('coordinates')
-            if coords is None:
-                raise KeyError(f"Coordinates missing for point {point_key}")
-            if len(coords) != 3:
-                raise ValueError(f"Expected 3 coordinate components (x,y,z), got {len(coords)}")
-
-            # Y is horizontal, Z is pointing down
-            y_coords.append(coords[1])
-            z_coords.append(coords[2])
-
-            feature_data = point_data.get(feature_name)
-            if feature_data is None:
-                raise KeyError(f"Feature '{feature_name}' missing for point {point_key}")
-
-            if metric_type == 'dominant_psd':
-                psd_welch = feature_data.get('psdwelch')
-                if psd_welch is None or len(psd_welch) == 0:
-                    raise ValueError(f"PSD data missing or empty for {feature_name} at point {point_key}")
-                values.append(np.max(psd_welch)) # Captures the dominant cyclic frequency amplitude
-            else:
-                val = feature_data.get(metric_type)
-                if val is None:
-                    raise KeyError(f"Metric '{metric_type}' missing for {feature_name} at point {point_key}")
-                values.append(val)
-
-        return np.array(y_coords), np.array(z_coords), np.array(values)
-
-    def _calculate_wake_center(self, y_coords, z_coords, intensities):
-        """
-        Calculates the center of mass of the wake based on the provided intensity distribution.
-        """
-        if len(y_coords) != len(z_coords) or len(y_coords) != len(intensities):
-            raise ValueError("Mismatched array lengths in wake center calculation.")
-
-        # Filter out negative deficits (speed-ups outside the wake) to find the core
-        weights = np.maximum(intensities, 0.0)
-        total_weight = np.sum(weights)
-
-        if total_weight <= 0:
-            raise ValueError("Total weight for wake center calculation is zero or negative. No distinct wake detected.")
-
-        y_center = np.sum(y_coords * weights) / total_weight
-        z_center = np.sum(z_coords * weights) / total_weight
-
-        return y_center, z_center
-
-    def _plot_spatial_heatmap(self, ax, y, z, values, title, cmap, invert_z):
-        """
-        Helper method to plot individual spatial scatter heatmaps.
-        """
-        scatter = ax.scatter(y, z, c=values, cmap=cmap, s=250, edgecolors='black')
-        ax.set_title(title)
-        ax.set_xlabel("Y Coordinate [mm] (Horizontal Left)")
-        ax.set_ylabel("Z Coordinate [mm] (Down)")
-        if invert_z:
-            ax.invert_yaxis() # Z points down, so higher values should be lower on the plot axis
-        return scatter
-
-    def generate_feature_analysis_heatmaps(self):
-        """
-        Generates comprehensive spatial heatmaps for features (Velocity, p_s, p_t)
-        to visually justify which metrics are being mapped downstream.
-        """
-        features = ['Velocity', 'p_s', 'p_t']
-        metrics = ['mean', 'rms', 'dominant_psd']
-        yaw_cases = list(self.processed_data.keys())
-
-        for feature in features:
-            fig, axes = plt.subplots(len(yaw_cases), len(metrics), figsize=(18, 5 * len(yaw_cases)))
-            
-            # Text Transparency Requirement
-            fig.suptitle(f"Feature Analysis Heatmaps: {feature}\n"
-                         f"SELECTION RULE TRANSPARENCY:\n"
-                         f"1. 'mean' values are selected to generate standard Time-Averaged Wake Maps.\n"
-                         f"2. 'dominant_psd' values are selected to map Cyclical Wake Turbulence caused by rotor frequencies.",
-                         fontsize=14, fontweight='bold', color='darkred')
-
-            for i, yaw in enumerate(yaw_cases):
-                for j, metric in enumerate(metrics):
-                    ax = axes[i, j] if len(yaw_cases) > 1 else axes[j]
-                    y, z, vals = self._extract_metric(yaw, feature, metric)
-                    scatter = self._plot_spatial_heatmap(
-                        ax, y, z, vals,
-                        title=f"Yaw Case: {yaw} | Metric Map: {metric}",
-                        cmap='viridis',
-                        invert_z=True
-                    )
-                    fig.colorbar(scatter, ax=ax, label=metric)
-
-            plt.tight_layout(rect=[0, 0, 1, 0.90])
-            filepath = os.path.join(self.output_directory, f"heatmap_analysis_{feature}.png")
-            plt.savefig(filepath)
-            print(f"Saved feature analysis heatmap: {filepath}")
-
-    def generate_cyclical_wake_maps(self):
-        """
-        Generates continuous triangulated wake maps showing both average deficit 
-        and cyclic turbulence intensity, overlaying the wake center shift.
-        """
-        yaw_cases = list(self.processed_data.keys())
-
-        # Setup 2 distinct figures for comparison
-        fig1, axes1 = plt.subplots(1, len(yaw_cases), figsize=(7 * len(yaw_cases), 7))
-        fig1.suptitle("Time-Averaged Wake Map (Velocity Deficit)\nDerived from 'mean' Velocity Feature", fontsize=16, fontweight='bold')
-
-        fig2, axes2 = plt.subplots(1, len(yaw_cases), figsize=(7 * len(yaw_cases), 7))
-        fig2.suptitle("Cyclical Wake Intensity Map (Rotor Wake Turbulence)\nDerived from 'dominant_psd' Velocity Feature", fontsize=16, fontweight='bold')
-
-        for i, yaw in enumerate(yaw_cases):
-            # --- MAP 1: Steady State Velocity Deficit ---
-            y, z, mean_vel = self._extract_metric(yaw, 'Velocity', 'mean')
-            # Calculate physical velocity deficit based on reference speed
-            deficit = 1.0 - (mean_vel / self.reference_windspeed)
-
-            ax1 = axes1[i]
-            tricontour1 = ax1.tricontourf(y, z, deficit, levels=20, cmap='coolwarm')
-            ax1.plot(y, z, 'k.', markersize=6) # Mark physical sensor nodes
-            ax1.set_title(f"Yaw Case: {yaw}")
-            ax1.set_xlabel("Y Coordinate [mm] (Horizontal Left)")
-            ax1.set_ylabel("Z Coordinate [mm] (Down)")
-            ax1.invert_yaxis()
-            fig1.colorbar(tricontour1, ax=ax1, label="Velocity Deficit [-]")
-
-            # Track and annotate wake center
-            y_c1, z_c1 = self._calculate_wake_center(y, z, deficit)
-            ax1.plot(y_c1, z_c1, 'r*', markersize=18, markeredgecolor='black', label="Wake Center")
-            ax1.text(y_c1, z_c1 - 20, f"Wake Center:\nY={y_c1:.1f}\nZ={z_c1:.1f}", color='red', weight='bold', ha='center', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
-
-            # --- MAP 2: Cyclical Turbulence Intensity ---
-            y_cyc, z_cyc, peak_psd = self._extract_metric(yaw, 'Velocity', 'dominant_psd')
-
-            ax2 = axes2[i]
-            tricontour2 = ax2.tricontourf(y_cyc, z_cyc, peak_psd, levels=20, cmap='plasma')
-            ax2.plot(y_cyc, z_cyc, 'k.', markersize=6)
-            ax2.set_title(f"Yaw Case: {yaw}")
-            ax2.set_xlabel("Y Coordinate [mm] (Horizontal Left)")
-            ax2.set_ylabel("Z Coordinate [mm] (Down)")
-            ax2.invert_yaxis()
-            fig2.colorbar(tricontour2, ax=ax2, label="Peak PSD Magnitude [(m/s)^2/Hz]")
-
-            # Track and annotate cyclical center (often differs from velocity deficit center)
-            y_c2, z_c2 = self._calculate_wake_center(y_cyc, z_cyc, peak_psd)
-            ax2.plot(y_c2, z_c2, 'r*', markersize=18, markeredgecolor='black', label="Intensity Center")
-            ax2.text(y_c2, z_c2 - 20, f"Intensity Center:\nY={y_c2:.1f}\nZ={z_c2:.1f}", color='red', weight='bold', ha='center', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
-
-        fig1.tight_layout(rect=[0, 0, 1, 0.90])
-        fig2.tight_layout(rect=[0, 0, 1, 0.90])
-
-        path1 = os.path.join(self.output_directory, "wake_map_time_averaged_deficit.png")
-        path2 = os.path.join(self.output_directory, "wake_map_cyclical_intensity.png")
-
-        fig1.savefig(path1)
-        fig2.savefig(path2)
-        print(f"Saved wake maps: {path1} & {path2}")
-
-    def execute(self):
-        """
-        Central execution routing.
-        """
-        self.generate_feature_analysis_heatmaps()
-        self.generate_cyclical_wake_maps()
-        plt.show()
 
 # Execution
 if __name__ == "__main__":
 
-    file_paths = ["C:/dev/wind-tunnel-testing/measurements/yaw_minus30/00_Results/Results_transient_17-6-2026_FRAP_group02_yawM30.mat", 
-                  "C:/dev/wind-tunnel-testing/measurements/yaw00/00_Results/Results_transient_17-6-2026_FRAP_group02_yaw00.mat",
-                  "C:/dev/wind-tunnel-testing/measurements/yaw_plus30/00_Results/Results_transient_17-6-2026_FRAP_group02_yawP30.mat"]
+    file_paths = ["C:/dev/wind-tunnel-testing/measurements/yaw_minus30/Results_transient_17-6-2026_FRAP_group02_yawM30.mat", 
+                  "C:/dev/wind-tunnel-testing/measurements/yaw_00/Results_transient_17-6-2026_FRAP_group02_yaw00.mat",
+                  "C:/dev/wind-tunnel-testing/measurements/yaw_plus30/Results_transient_17-6-2026_FRAP_group02_yawP30.mat"]
     
     mat_reader = MatFilereader(file_paths)
     data_processor = DataProcessor(mat_reader.rawdata)
+
     # Initialize generator with explicit parameters, omitting fallbacks
-    wake_map_generator = WakeMapGenerator(
-        processed_data=data_processor.processed_data,
-        output_directory="graphs",
-        reference_windspeed=6.23
-    )
+    wake_map_generator = WakeMapGenerator(data_processor.processed_data, "wake_maps", 1.0)
     
-    # Execute visualization suite
-    wake_map_generator.execute()
+    # Show all plots in the end
     plt.show()
