@@ -477,6 +477,22 @@ class WakeMapGenerator:
         return yaw_angle.replace('+', 'p').replace('-', 'm')
 
     @staticmethod
+    def _metric_display_name(metric_name):
+        if metric_name == 'u_trans':
+            return 'u'
+        if metric_name == 'v_trans':
+            return 'v'
+        if metric_name == 'w_trans':
+            return 'w'
+        return metric_name
+
+    @staticmethod
+    def _metric_units(metric_name):
+        if metric_name in {'alpha', 'beta'}:
+            return 'deg', 'deg^2'
+        return 'm/s', '(m/s)^2'
+
+    @staticmethod
     def _as_scalar(metric_entry, key, yaw_angle, point_key, metric_name):
         value = np.asarray(metric_entry[key]).reshape(-1)
         if value.size != 1:
@@ -587,7 +603,7 @@ class WakeMapGenerator:
             variance_values, ranges['var_min'], ranges['var_max']
         )
 
-        fig, ax = plt.subplots(figsize=(8.0, 6.2))
+        fig, ax = plt.subplots(figsize=(9.2, 5.6))
         contour = ax.tricontourf(
             y_values,
             z_values,
@@ -609,8 +625,11 @@ class WakeMapGenerator:
             zorder=3,
         )
 
+        metric_label = self._metric_display_name(metric_name)
+        value_unit, variance_unit = self._metric_units(metric_name)
+
         colorbar = fig.colorbar(contour, ax=ax)
-        colorbar.set_label(f"{metric_name} representative value (median)")
+        colorbar.set_label(f"{metric_label} (median) [{value_unit}]")
 
         if np.isclose(ranges['var_min'], ranges['var_max']):
             size_reference_values = [ranges['var_min']]
@@ -626,7 +645,7 @@ class WakeMapGenerator:
             size_handles.append(
                 ax.scatter([], [], s=marker_size, c='white', edgecolors='black', linewidths=0.9)
             )
-            size_labels.append(f"var={variance_value:.3e}")
+            size_labels.append(f"var={variance_value:.3e} {variance_unit}")
 
         size_legend = ax.legend(
             size_handles,
@@ -639,9 +658,11 @@ class WakeMapGenerator:
         )
         ax.add_artist(size_legend)
 
-        ax.set_title(f"Yaw {yaw_angle} | {metric_name} representative map")
-        ax.set_xlabel('Y coordinate')
-        ax.set_ylabel('Z coordinate')
+        ax.set_title(f"Yaw {yaw_angle} | {metric_label} map")
+        ax.set_xlabel('Y coordinate [mm]')
+        ax.set_ylabel('Z coordinate [mm]')
+        # Equal data scaling: one unit on Y equals one unit on Z.
+        ax.set_aspect('equal', adjustable='box')
         ax.grid(alpha=0.25, linestyle='--', linewidth=0.6)
         ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
