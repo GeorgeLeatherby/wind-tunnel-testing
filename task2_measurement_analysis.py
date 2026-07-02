@@ -21,6 +21,7 @@ import numpy as np
 from scipy.io import loadmat
 from scipy.signal import welch, find_peaks
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import os
 import mat73
 
@@ -455,6 +456,237 @@ class WakeMapGenerator:
         if not os.path.exists(self.output_directory):
             os.makedirs(self.output_directory)
 
+        # Coordinate mapping assumption for coord = [X, Y, Z].
+        self.coord_y_index = 1
+        self.coord_z_index = 2
+        self.metric_names = ['alpha', 'beta', 'velocity', 'u_trans', 'v_trans', 'w_trans']
+        self.yaw_order = ['-30', '0', '+30']
+        self.output_dpi = 400
+        self.contour_levels = 20
+        self.marker_size_min = 40
+        self.marker_size_max = 260
+
+    @staticmethod
+    def _yaw_label_for_filename(yaw_angle):
+        if yaw_angle == '-30':
+            return 'm30'
+        if yaw_angle == '+30':
+            return 'p30'
+        if yaw_angle == '0':
+            return '0'
+        return yaw_angle.replace('+', 'p').replace('-', 'm')
+
+    @staticmethod
+    def _as_scalar(metric_entry, key, yaw_angle, point_key, metric_name):
+        value = np.asarray(metric_entry[key]).reshape(-1)
+        if value.size != 1:
+            raise ValueError(
+                f"Expected scalar array for '{metric_name}.{key}' at yaw {yaw_angle}, point {point_key}, "
+                f"got shape {np.asarray(metric_entry[key]).shape}."
+            )
+        return float(value[0])
+
+    def _extract_metric_point_arrays(self, yaw_angle, metric_name):
+        if yaw_angle not in self.processed_data:
+            raise ValueError(f"Yaw '{yaw_angle}' not found in processed_data.")
+
+        y_values = []
+        z_values = []
+        representative_values = []
+        variance_values = []
+
+        for point_key in sorted(self.processed_data[yaw_angle].keys()):
+            point_data = self.processed_data[yaw_angle][point_key]
+
+            if 'coord' not in point_data:
+                raise ValueError(f"Missing 'coord' at yaw {yaw_angle}, point {point_key}.")
+            if metric_name not in point_data:
+                raise ValueError(f"Missing metric '{metric_name}' at yaw {yaw_angle}, point {point_key}.")
+
+            coord = np.asarray(point_data['coord']).reshape(-1)
+            if coord.size < 3:
+                raise ValueError(
+                    f"Expected coord with 3 elements at yaw {yaw_angle}, point {point_key}, got {coord.shape}."
+                )
+
+            metric_entry = point_data[metric_name]
+            if 'median' not in metric_entry or 'std_dev' not in metric_entry:
+                raise ValueError(
+                    f"Missing 'median' or 'std_dev' in metric '{metric_name}' at yaw {yaw_angle}, point {point_key}."
+                )
+
+            representative = self._as_scalar(metric_entry, 'median', yaw_angle, point_key, metric_name)
+            std_dev = self._as_scalar(metric_entry, 'std_dev', yaw_angle, point_key, metric_name)
+            variance = std_dev ** 2
+
+            y_values.append(float(coord[self.coord_y_index]))
+            z_values.append(float(coord[self.coord_z_index]))
+            representative_values.append(representative)
+            variance_values.append(variance)
+
+        return (
+            np.asarray(y_values, dtype=float),
+            np.asarray(z_values, dtype=float),
+            np.asarray(representative_values, dtype=float),
+            np.asarray(variance_values, dtype=float),
+        )
+
+    def _compute_global_ranges(self):
+        global_ranges = {}
+        for metric_name in self.metric_names:
+            all_representatives = []
+            all_variances = []
+
+            for yaw_angle in self.yaw_order:
+                y_values, z_values, representative_values, variance_values = self._extract_metric_point_arrays(
+                    yaw_angle, metric_name
+                )
+
+                if y_values.size < 3 or z_values.size < 3:
+                    raise ValueError(
+                        f"Not enough measurement points for contour plot in yaw {yaw_angle}, metric {metric_name}."
+                    )
+
+                all_representatives.append(representative_values)
+                all_variances.append(variance_values)
+
+            reps = np.concatenate(all_representatives)
+            vars_ = np.concatenate(all_variances)
+
+            color_min = float(np.min(reps))
+            color_max = float(np.max(reps))
+            if np.isclose(color_min, color_max):
+                color_min -= 1e-9
+                color_max += 1e-9
+
+            var_min = float(np.min(vars_))
+            var_max = float(np.max(vars_))
+
+            global_ranges[metric_name] = {
+                'color_min': color_min,
+                'color_max': color_max,
+                'var_min': var_min,
+                'var_max': var_max,
+            }
+
+        return global_ranges
+
+    def _variance_to_marker_size(self, variance_array, var_min, var_max):
+        if np.isclose(var_min, var_max):
+            return np.full_like(variance_array, (self.marker_size_min + self.marker_size_max) / 2.0)
+
+        normalized = (variance_array - var_min) / (var_max - var_min)
+        return self.marker_size_min + normalized * (self.marker_size_max - self.marker_size_min)
+
+    def _plot_single_metric_map(self, yaw_angle, metric_name, ranges, output_folder):
+        y_values, z_values, representative_values, variance_values = self._extract_metric_point_arrays(
+            yaw_angle, metric_name
+        )
+
+        marker_sizes = self._variance_to_marker_size(
+            variance_values, ranges['var_min'], ranges['var_max']
+        )
+
+        fig, ax = plt.subplots(figsize=(8.0, 6.2))
+        contour = ax.tricontourf(
+            y_values,
+            z_values,
+            representative_values,
+            levels=self.contour_levels,
+            cmap='viridis',
+            vmin=ranges['color_min'],
+            vmax=ranges['color_max'],
+        )
+
+        ax.scatter(
+            y_values,
+            z_values,
+            s=marker_sizes,
+            c='white',
+            edgecolors='black',
+            linewidths=0.9,
+            alpha=0.95,
+            zorder=3,
+        )
+
+        colorbar = fig.colorbar(contour, ax=ax)
+        colorbar.set_label(f"{metric_name} representative value (median)")
+
+        if np.isclose(ranges['var_min'], ranges['var_max']):
+            size_reference_values = [ranges['var_min']]
+        else:
+            size_reference_values = np.linspace(ranges['var_min'], ranges['var_max'], 3)
+
+        size_handles = []
+        size_labels = []
+        for variance_value in size_reference_values:
+            marker_size = self._variance_to_marker_size(
+                np.asarray([variance_value], dtype=float), ranges['var_min'], ranges['var_max']
+            )[0]
+            size_handles.append(
+                ax.scatter([], [], s=marker_size, c='white', edgecolors='black', linewidths=0.9)
+            )
+            size_labels.append(f"var={variance_value:.3e}")
+
+        size_legend = ax.legend(
+            size_handles,
+            size_labels,
+            title='Marker size (variance)',
+            loc='upper right',
+            frameon=True,
+            fontsize=9,
+            title_fontsize=9,
+        )
+        ax.add_artist(size_legend)
+
+        ax.set_title(f"Yaw {yaw_angle} | {metric_name} representative map")
+        ax.set_xlabel('Y coordinate')
+        ax.set_ylabel('Z coordinate')
+        ax.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+
+        filename = f"map_yaw_{self._yaw_label_for_filename(yaw_angle)}_{metric_name}.png"
+        output_path = os.path.join(output_folder, filename)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=self.output_dpi)
+        plt.close(fig)
+        return output_path
+
+    def generate_representative_metric_maps(self):
+        output_folder = os.path.join(os.getcwd(), 'metrics_analysis')
+        os.makedirs(output_folder, exist_ok=True)
+
+        global_ranges = self._compute_global_ranges()
+        generated_files = []
+
+        for yaw_angle in self.yaw_order:
+            for metric_name in self.metric_names:
+                generated_files.append(
+                    self._plot_single_metric_map(
+                        yaw_angle,
+                        metric_name,
+                        global_ranges[metric_name],
+                        output_folder,
+                    )
+                )
+
+        print("\n=== Representative Metric Maps Summary ===")
+        print("Contour interpolation: matplotlib tricontourf (triangulated linear interpolation), no extra smoothing")
+        print(f"Output folder: {output_folder}")
+        print(f"Output format: png, dpi={self.output_dpi}")
+        print(f"Generated files: {len(generated_files)}")
+
+        for metric_name in self.metric_names:
+            ranges = global_ranges[metric_name]
+            print(
+                f"metric={metric_name}: color_limits=({ranges['color_min']:.6g}, {ranges['color_max']:.6g}), "
+                f"variance_limits=({ranges['var_min']:.6g}, {ranges['var_max']:.6g})"
+            )
+
+        for output_path in generated_files:
+            print(f"  {output_path}")
+
 
 
 # Execution
@@ -469,6 +701,7 @@ if __name__ == "__main__":
 
     # Initialize generator with explicit parameters, omitting fallbacks
     wake_map_generator = WakeMapGenerator(data_processor.processed_data, "wake_maps", 1.0)
+    wake_map_generator.generate_representative_metric_maps()
     
     # Show all plots in the end
     plt.show()
