@@ -84,6 +84,8 @@ class DataProcessor:
         self.rawdata = rawdata
         self.processed_data = {} # A top-level dictionary to store processed data for each yaw angle
         self.quality_assessment = {}
+        self.wake_centers = {}
+        self.reference_freestream = 6.23  # m/s
         self.sampling_frequency = 10000  # Sampling frequency (in Hz) for the time series data
         self.measuremnt_duration = 10  # Duration (in seconds) of the measurement data
         self.data_processing()  # Call the data processing method upon initialization
@@ -275,7 +277,13 @@ class DataProcessor:
 
         psd_result = np.abs(normalized_fft) ** 2 / 2 / np.diff(frequencies)[0]
 
-        f_welch, psd_welch = welch(signal_array, fs=self.sampling_frequency, nperseg=1024)
+        f_welch, psd_welch = welch(signal_array, fs=self.sampling_frequency, nperseg=2048)
+        expected_welch_shape = (1025,)
+        if f_welch.shape != expected_welch_shape or psd_welch.shape != expected_welch_shape:
+            raise ValueError(
+                f"Welch output shape mismatch at yaw {yaw_angle}, point {point_idx:02d}, series '{series_name}': "
+                f"expected {expected_welch_shape}, got fwelch={f_welch.shape}, psdwelch={psd_welch.shape}."
+            )
         peak_signals, properties = find_peaks(psd_welch, height=np.max(psd_welch) * 0.1)
 
         metrics = {
@@ -329,11 +337,16 @@ class DataProcessor:
         """
         self.processed_data = {}
         self.quality_assessment = {}
+        self.wake_centers = {}
 
         for file_path, mat_data in self.rawdata.items():
             yaw_angle = self._normalize_yaw_label(file_path)
             self.processed_data[yaw_angle] = {f"{i:02d}": {} for i in range(23)}
             resultscell = mat_data['resultscell']
+
+            yaw_y_coords = []
+            yaw_z_coords = []
+            yaw_u_means = []
 
             for point_idx, measurement_point in enumerate(resultscell):
                 point_payload = measurement_point[1]
@@ -393,6 +406,17 @@ class DataProcessor:
                 v_trans = -w_uncor
                 w_trans = v_uncor
 
+                u_fluct = u_uncor - np.mean(u_uncor)
+                v_fluct = v_trans - np.mean(v_trans)
+                w_fluct = w_trans - np.mean(w_trans)
+                tke_value = 0.5 * (
+                    np.mean(u_fluct ** 2) + np.mean(v_fluct ** 2) + np.mean(w_fluct ** 2)
+                )
+
+                self._validate_shape(yaw_angle, point_idx, 'u_fluct', u_fluct, (100000,))
+                self._validate_shape(yaw_angle, point_idx, 'v_fluct', v_fluct, (100000,))
+                self._validate_shape(yaw_angle, point_idx, 'w_fluct', w_fluct, (100000,))
+
                 self._validate_shape(yaw_angle, point_idx, 'u_trans', u_uncor, (100000,))
                 self._validate_shape(yaw_angle, point_idx, 'v_trans', v_trans, (100000,))
                 self._validate_shape(yaw_angle, point_idx, 'w_trans', w_trans, (100000,))
@@ -415,12 +439,38 @@ class DataProcessor:
                     'u_trans': self._build_signal_metrics(u_uncor, yaw_angle, point_idx, 'u_trans'),
                     'v_trans': self._build_signal_metrics(v_trans, yaw_angle, point_idx, 'v_trans'),
                     'w_trans': self._build_signal_metrics(w_trans, yaw_angle, point_idx, 'w_trans'),
+                    'u_fluct': u_fluct,
+                    'v_fluct': v_fluct,
+                    'w_fluct': w_fluct,
+                    'tke': np.array([tke_value]),
                     'coord': coord_data,
                     'U_WT': u_wt_data,
                 }
 
                 measurement_point_key = f"{point_idx:02d}"
                 self.processed_data[yaw_angle][measurement_point_key] = processed_metrics
+
+                yaw_y_coords.append(float(coord_data[1]))
+                yaw_z_coords.append(float(coord_data[2]))
+                yaw_u_means.append(float(processed_metrics['u_trans']['mean'][0]))
+
+            y_coords = np.asarray(yaw_y_coords, dtype=float)
+            z_coords = np.asarray(yaw_z_coords, dtype=float)
+            u_means = np.asarray(yaw_u_means, dtype=float)
+            deficit_weights = np.maximum(self.reference_freestream - u_means, 0.0)
+            weight_sum = float(np.sum(deficit_weights))
+            if weight_sum <= 0.0:
+                raise ValueError(
+                    f"Wake centroid cannot be computed for yaw {yaw_angle}: non-positive deficit weight sum ({weight_sum})."
+                )
+
+            y_center = float(np.sum(y_coords * deficit_weights) / weight_sum)
+            z_center = float(np.sum(z_coords * deficit_weights) / weight_sum)
+            self.wake_centers[yaw_angle] = {
+                'Yc': y_center,
+                'Zc': z_center,
+                'sum_weights': weight_sum,
+            }
 
         np.savez("processed_data.npz", processed_data=self.processed_data)
         self._print_quality_assessment()
@@ -432,7 +482,7 @@ class WakeMapGenerator:
     Aims to fulfill step 5 of the general processing steps outlined in the module docstring.
     """
 
-    def __init__(self, processed_data, output_directory, reference_windspeed):
+    def __init__(self, processed_data, wake_centers, output_directory, reference_windspeed):
         """
         Initializes the WakeMapGenerator with processed measurement data.
 
@@ -444,12 +494,15 @@ class WakeMapGenerator:
         # Failfast checks
         if not processed_data:
             raise ValueError("Processed data dictionary is empty.")
+        if not wake_centers:
+            raise ValueError("Wake center dictionary is empty.")
         if not isinstance(output_directory, str):
             raise TypeError("output_directory must be a string.")
         if not isinstance(reference_windspeed, (int, float)):
             raise TypeError("reference_windspeed must be a number.")
 
         self.processed_data = processed_data
+        self.wake_centers = wake_centers
         self.output_directory = output_directory
         self.reference_windspeed = reference_windspeed
 
@@ -465,6 +518,8 @@ class WakeMapGenerator:
         self.contour_levels = 20
         self.marker_size_min = 40
         self.marker_size_max = 260
+        self.graph_output_folder = os.path.join(os.getcwd(), 'graphs')
+        os.makedirs(self.graph_output_folder, exist_ok=True)
 
     @staticmethod
     def _yaw_label_for_filename(yaw_angle):
@@ -625,6 +680,21 @@ class WakeMapGenerator:
             zorder=3,
         )
 
+        if yaw_angle not in self.wake_centers:
+            raise ValueError(f"Missing wake center for yaw {yaw_angle}.")
+        yc = self.wake_centers[yaw_angle]['Yc']
+        zc = self.wake_centers[yaw_angle]['Zc']
+        ax.scatter(
+            [yc],
+            [zc],
+            marker='*',
+            c='yellow',
+            s=200,
+            edgecolors='black',
+            linewidths=1.1,
+            zorder=5,
+        )
+
         metric_label = self._metric_display_name(metric_name)
         value_unit, variance_unit = self._metric_units(metric_name)
 
@@ -663,6 +733,7 @@ class WakeMapGenerator:
         ax.set_ylabel('Z coordinate [mm]')
         # Equal data scaling: one unit on Y equals one unit on Z.
         ax.set_aspect('equal', adjustable='box')
+        ax.invert_yaxis()
         ax.grid(alpha=0.25, linestyle='--', linewidth=0.6)
         ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
@@ -675,7 +746,7 @@ class WakeMapGenerator:
         return output_path
 
     def generate_representative_metric_maps(self):
-        output_folder = os.path.join(os.getcwd(), 'metrics_analysis')
+        output_folder = self.graph_output_folder
         os.makedirs(output_folder, exist_ok=True)
 
         global_ranges = self._compute_global_ranges()
@@ -708,6 +779,242 @@ class WakeMapGenerator:
         for output_path in generated_files:
             print(f"  {output_path}")
 
+    def _extract_tke_point_arrays(self, yaw_angle):
+        if yaw_angle not in self.processed_data:
+            raise ValueError(f"Yaw '{yaw_angle}' not found in processed_data.")
+
+        y_values = []
+        z_values = []
+        tke_values = []
+
+        for point_key in sorted(self.processed_data[yaw_angle].keys()):
+            point_data = self.processed_data[yaw_angle][point_key]
+            if 'coord' not in point_data:
+                raise ValueError(f"Missing 'coord' at yaw {yaw_angle}, point {point_key}.")
+            if 'tke' not in point_data:
+                raise ValueError(f"Missing 'tke' at yaw {yaw_angle}, point {point_key}.")
+
+            coord = np.asarray(point_data['coord']).reshape(-1)
+            if coord.size < 3:
+                raise ValueError(
+                    f"Expected coord with 3 elements at yaw {yaw_angle}, point {point_key}, got {coord.shape}."
+                )
+
+            tke_array = np.asarray(point_data['tke']).reshape(-1)
+            if tke_array.size != 1:
+                raise ValueError(
+                    f"Expected scalar tke at yaw {yaw_angle}, point {point_key}, got shape {np.asarray(point_data['tke']).shape}."
+                )
+
+            y_values.append(float(coord[self.coord_y_index]))
+            z_values.append(float(coord[self.coord_z_index]))
+            tke_values.append(float(tke_array[0]))
+
+        return (
+            np.asarray(y_values, dtype=float),
+            np.asarray(z_values, dtype=float),
+            np.asarray(tke_values, dtype=float),
+        )
+
+    def generate_tke_maps(self):
+        output_folder = self.graph_output_folder
+        os.makedirs(output_folder, exist_ok=True)
+
+        all_tke = []
+        for yaw_angle in self.yaw_order:
+            _, _, tke_values = self._extract_tke_point_arrays(yaw_angle)
+            all_tke.append(tke_values)
+
+        global_tke = np.concatenate(all_tke)
+        tke_min = float(np.min(global_tke))
+        tke_max = float(np.max(global_tke))
+        if np.isclose(tke_min, tke_max):
+            tke_min -= 1e-12
+            tke_max += 1e-12
+
+        generated_files = []
+        for yaw_angle in self.yaw_order:
+            y_values, z_values, tke_values = self._extract_tke_point_arrays(yaw_angle)
+
+            fig, ax = plt.subplots(figsize=(9.2, 5.6))
+            contour = ax.tricontourf(
+                y_values,
+                z_values,
+                tke_values,
+                levels=self.contour_levels,
+                cmap='viridis',
+                vmin=tke_min,
+                vmax=tke_max,
+            )
+
+            ax.scatter(
+                y_values,
+                z_values,
+                s=65,
+                c='white',
+                edgecolors='black',
+                linewidths=0.9,
+                alpha=0.95,
+                zorder=3,
+            )
+
+            yc = self.wake_centers[yaw_angle]['Yc']
+            zc = self.wake_centers[yaw_angle]['Zc']
+            ax.scatter(
+                [yc],
+                [zc],
+                marker='*',
+                c='yellow',
+                s=200,
+                edgecolors='black',
+                linewidths=1.1,
+                zorder=5,
+            )
+
+            colorbar = fig.colorbar(contour, ax=ax)
+            colorbar.set_label('tke [m^2/s^2]')
+
+            ax.set_title(f"Yaw {yaw_angle} | tke map")
+            ax.set_xlabel('Y coordinate [mm]')
+            ax.set_ylabel('Z coordinate [mm]')
+            ax.set_aspect('equal', adjustable='box')
+            ax.invert_yaxis()
+            ax.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+
+            filename = f"map_yaw_{self._yaw_label_for_filename(yaw_angle)}_tke.png"
+            output_path = os.path.join(output_folder, filename)
+            fig.tight_layout()
+            fig.savefig(output_path, dpi=self.output_dpi)
+            plt.close(fig)
+            generated_files.append(output_path)
+
+        print("\n=== TKE Maps Summary ===")
+        print(f"Output folder: {output_folder}")
+        print(f"Output format: png, dpi={self.output_dpi}")
+        print(f"Generated files: {len(generated_files)}")
+        print(f"tke color limits=({tke_min:.6g}, {tke_max:.6g})")
+        for output_path in generated_files:
+            print(f"  {output_path}")
+
+    def _extract_centerline_spectral_matrix(self, yaw_angle, z_target=0.0):
+        if yaw_angle not in self.processed_data:
+            raise ValueError(f"Yaw '{yaw_angle}' not found in processed_data.")
+
+        y_positions = []
+        spectra = []
+        f_reference = None
+
+        for point_key in sorted(self.processed_data[yaw_angle].keys()):
+            point_data = self.processed_data[yaw_angle][point_key]
+            coord = np.asarray(point_data['coord']).reshape(-1)
+            if coord.size < 3:
+                raise ValueError(
+                    f"Expected coord with 3 elements at yaw {yaw_angle}, point {point_key}, got {coord.shape}."
+                )
+
+            z_value = float(coord[self.coord_z_index])
+            if not np.isclose(z_value, z_target):
+                continue
+
+            metric_entry = point_data['velocity']
+            f_welch = np.asarray(metric_entry['fwelch']).reshape(-1)
+            psd_welch = np.asarray(metric_entry['psdwelch']).reshape(-1)
+            if f_welch.shape != (1025,) or psd_welch.shape != (1025,):
+                raise ValueError(
+                    f"Unexpected Welch shape at yaw {yaw_angle}, point {point_key}: "
+                    f"fwelch={f_welch.shape}, psdwelch={psd_welch.shape}."
+                )
+
+            if f_reference is None:
+                f_reference = f_welch
+            elif not np.allclose(f_reference, f_welch):
+                raise ValueError(
+                    f"Inconsistent Welch frequency vectors at yaw {yaw_angle}, point {point_key}."
+                )
+
+            y_positions.append(float(coord[self.coord_y_index]))
+            spectra.append(psd_welch)
+
+        if not y_positions:
+            raise ValueError(f"No centerline points found at Z={z_target} mm for yaw {yaw_angle}.")
+
+        y_positions = np.asarray(y_positions, dtype=float)
+        spectra = np.asarray(spectra, dtype=float)
+        sort_idx = np.argsort(y_positions)
+        return y_positions[sort_idx], f_reference, spectra[sort_idx, :]
+
+    def _plot_spatial_spectral_cascade(self, max_freq, filename):
+        subplot_payload = []
+        global_vmin = None
+        global_vmax = None
+
+        for yaw_angle in self.yaw_order:
+            y_positions, frequencies, psd_matrix = self._extract_centerline_spectral_matrix(yaw_angle, z_target=0.0)
+            freq_mask = frequencies <= max_freq
+            if not np.any(freq_mask):
+                raise ValueError(f"No frequency bins found up to {max_freq} Hz for yaw {yaw_angle}.")
+
+            freq_sel = frequencies[freq_mask]
+            psd_sel = psd_matrix[:, freq_mask]
+            log_psd = np.log10(np.maximum(psd_sel, np.finfo(float).tiny))
+
+            local_min = float(np.min(log_psd))
+            local_max = float(np.max(log_psd))
+            global_vmin = local_min if global_vmin is None else min(global_vmin, local_min)
+            global_vmax = local_max if global_vmax is None else max(global_vmax, local_max)
+
+            subplot_payload.append((yaw_angle, y_positions, freq_sel, log_psd))
+
+        fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.6), sharey=True)
+        if not isinstance(axes, np.ndarray):
+            axes = np.asarray([axes])
+
+        pcm = None
+        for ax, (yaw_angle, y_positions, freq_sel, log_psd) in zip(axes, subplot_payload):
+            pcm = ax.pcolormesh(
+                freq_sel,
+                y_positions,
+                log_psd,
+                shading='auto',
+                cmap='viridis',
+                vmin=global_vmin,
+                vmax=global_vmax,
+            )
+            ax.set_title(f"Yaw {yaw_angle}")
+            ax.set_xlabel('Frequency [Hz]')
+            ax.grid(alpha=0.2, linestyle='--', linewidth=0.5)
+
+        axes[0].set_ylabel('Y coordinate [mm]')
+        fig.suptitle(f"Spatial-Spectral Cascade | Z=0 mm | 0-{int(max_freq)} Hz", y=1.02)
+        cbar = fig.colorbar(pcm, ax=axes.ravel().tolist(), shrink=0.98)
+        cbar.set_label('log10(psdwelch)')
+
+        output_path = os.path.join(self.graph_output_folder, filename)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=self.output_dpi)
+        plt.close(fig)
+        return output_path, global_vmin, global_vmax
+
+    def generate_spatial_spectral_cascade_maps(self):
+        low_path, low_vmin, low_vmax = self._plot_spatial_spectral_cascade(
+            max_freq=120.0,
+            filename='cascade_centerline_0_120Hz.png',
+        )
+        broad_path, broad_vmin, broad_vmax = self._plot_spatial_spectral_cascade(
+            max_freq=240.0,
+            filename='cascade_centerline_0_240Hz.png',
+        )
+
+        print("\n=== Spatial-Spectral Cascade Summary ===")
+        print(f"Output folder: {self.graph_output_folder}")
+        print(f"Output format: png, dpi={self.output_dpi}")
+        print(f"0-120 Hz color limits=({low_vmin:.6g}, {low_vmax:.6g})")
+        print(f"0-240 Hz color limits=({broad_vmin:.6g}, {broad_vmax:.6g})")
+        print(f"  {low_path}")
+        print(f"  {broad_path}")
+
 
 
 # Execution
@@ -721,8 +1028,10 @@ if __name__ == "__main__":
     data_processor = DataProcessor(mat_reader.rawdata)
 
     # Initialize generator with explicit parameters, omitting fallbacks
-    wake_map_generator = WakeMapGenerator(data_processor.processed_data, "wake_maps", 1.0)
+    wake_map_generator = WakeMapGenerator(data_processor.processed_data, data_processor.wake_centers, "wake_maps", 1.0)
     wake_map_generator.generate_representative_metric_maps()
+    wake_map_generator.generate_tke_maps()
+    wake_map_generator.generate_spatial_spectral_cascade_maps()
     
     # Show all plots in the end
     plt.show()
