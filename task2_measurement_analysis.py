@@ -20,8 +20,11 @@ General Processing Steps:
 import numpy as np
 from scipy.io import loadmat
 from scipy.signal import welch, find_peaks
+from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import FormatStrFormatter
+from matplotlib.patches import Ellipse
 import os
 import mat73
 
@@ -277,8 +280,8 @@ class DataProcessor:
 
         psd_result = np.abs(normalized_fft) ** 2 / 2 / np.diff(frequencies)[0]
 
-        f_welch, psd_welch = welch(signal_array, fs=self.sampling_frequency, nperseg=2048)
-        expected_welch_shape = (1025,)
+        f_welch, psd_welch = welch(signal_array, fs=self.sampling_frequency, nperseg=4096)
+        expected_welch_shape = (2049,)
         if f_welch.shape != expected_welch_shape or psd_welch.shape != expected_welch_shape:
             raise ValueError(
                 f"Welch output shape mismatch at yaw {yaw_angle}, point {point_idx:02d}, series '{series_name}': "
@@ -687,11 +690,11 @@ class WakeMapGenerator:
         ax.scatter(
             [yc],
             [zc],
-            marker='*',
+            marker='d',
             c='yellow',
-            s=200,
+            s=80,
             edgecolors='black',
-            linewidths=1.1,
+            linewidths=1.2,
             zorder=5,
         )
 
@@ -717,14 +720,18 @@ class WakeMapGenerator:
             )
             size_labels.append(f"var={variance_value:.3e} {variance_unit}")
 
+        wake_center_handle = ax.scatter([], [], marker='d', c='yellow', s=80, edgecolors='black', linewidths=1.2)
+        size_handles.append(wake_center_handle)
+        size_labels.append(f"wake center\ny_off = {yc:.1f} mm\nz_off = {zc:.1f} mm")
+
         size_legend = ax.legend(
             size_handles,
             size_labels,
             title='Marker size (variance)',
             loc='upper right',
             frameon=True,
-            fontsize=9,
-            title_fontsize=9,
+            fontsize=11,
+            title_fontsize=11,
         )
         ax.add_artist(size_legend)
 
@@ -734,7 +741,7 @@ class WakeMapGenerator:
         # Equal data scaling: one unit on Y equals one unit on Z.
         ax.set_aspect('equal', adjustable='box')
         ax.invert_yaxis()
-        ax.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+        ax.grid(alpha=0.4, linestyle='--', linewidth=0.6)
         ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
 
@@ -816,6 +823,44 @@ class WakeMapGenerator:
             np.asarray(tke_values, dtype=float),
         )
 
+    def _extract_swirl_point_arrays(self, yaw_angle):
+        if yaw_angle not in self.processed_data:
+            raise ValueError(f"Yaw '{yaw_angle}' not found in processed_data.")
+
+        y_values = []
+        z_values = []
+        v_values = []
+        w_values = []
+
+        for point_key in sorted(self.processed_data[yaw_angle].keys()):
+            point_data = self.processed_data[yaw_angle][point_key]
+            if 'coord' not in point_data:
+                raise ValueError(f"Missing 'coord' at yaw {yaw_angle}, point {point_key}.")
+            if 'v_trans' not in point_data or 'w_trans' not in point_data:
+                raise ValueError(f"Missing 'v_trans' or 'w_trans' at yaw {yaw_angle}, point {point_key}.")
+
+            coord = np.asarray(point_data['coord']).reshape(-1)
+            if coord.size < 3:
+                raise ValueError(
+                    f"Expected coord with 3 elements at yaw {yaw_angle}, point {point_key}, got {coord.shape}."
+                )
+
+            v_median = self._as_scalar(point_data['v_trans'], 'median', yaw_angle, point_key, 'v_trans')
+            w_median = self._as_scalar(point_data['w_trans'], 'median', yaw_angle, point_key, 'w_trans')
+
+            y_values.append(float(coord[self.coord_y_index]))
+            z_values.append(float(coord[self.coord_z_index]))
+            v_values.append(v_median)
+            w_values.append(w_median)
+
+        y_values = np.asarray(y_values, dtype=float)
+        z_values = np.asarray(z_values, dtype=float)
+        v_values = np.asarray(v_values, dtype=float)
+        w_values = np.asarray(w_values, dtype=float)
+        swirl_intensity = np.sqrt(v_values ** 2 + w_values ** 2)
+
+        return y_values, z_values, v_values, w_values, swirl_intensity
+
     def generate_tke_maps(self):
         output_folder = self.graph_output_folder
         os.makedirs(output_folder, exist_ok=True)
@@ -863,12 +908,21 @@ class WakeMapGenerator:
             ax.scatter(
                 [yc],
                 [zc],
-                marker='*',
+                marker='d',
                 c='yellow',
-                s=200,
+                s=80,
                 edgecolors='black',
-                linewidths=1.1,
+                linewidths=1.2,
                 zorder=5,
+            )
+
+            wake_center_handle = ax.scatter([], [], marker='d', c='yellow', s=80, edgecolors='black', linewidths=1.2)
+            ax.legend(
+                [wake_center_handle],
+                [f"wake center\ny_off = {yc:.1f} mm\nz_off = {zc:.1f} mm"],
+                loc='upper right',
+                frameon=True,
+                fontsize=10,
             )
 
             colorbar = fig.colorbar(contour, ax=ax)
@@ -898,6 +952,108 @@ class WakeMapGenerator:
         for output_path in generated_files:
             print(f"  {output_path}")
 
+    def generate_wake_swirl_maps(self):
+        output_folder = self.graph_output_folder
+        os.makedirs(output_folder, exist_ok=True)
+
+        payload = {}
+        all_intensities = []
+        for yaw_angle in self.yaw_order:
+            y_values, z_values, v_values, w_values, swirl_intensity = self._extract_swirl_point_arrays(yaw_angle)
+            payload[yaw_angle] = (y_values, z_values, v_values, w_values, swirl_intensity)
+            all_intensities.append(swirl_intensity)
+
+        all_intensities = np.concatenate(all_intensities)
+        swirl_min = float(np.min(all_intensities))
+        swirl_max = float(np.max(all_intensities))
+        if np.isclose(swirl_min, swirl_max):
+            swirl_min -= 1e-9
+            swirl_max += 1e-9
+
+        rotor_radius_mm = 550.0
+
+        fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.6), sharex=True, sharey=True)
+        if not isinstance(axes, np.ndarray):
+            axes = np.asarray([axes])
+
+        contour_handle = None
+        for ax, yaw_angle in zip(axes, self.yaw_order):
+            y_values, z_values, v_values, w_values, swirl_intensity = payload[yaw_angle]
+
+            contour_handle = ax.tricontourf(
+                y_values,
+                z_values,
+                swirl_intensity,
+                levels=self.contour_levels,
+                cmap='viridis',
+                vmin=swirl_min,
+                vmax=swirl_max,
+            )
+
+            ax.quiver(
+                y_values,
+                z_values,
+                v_values,
+                w_values,
+                color='black',
+                angles='xy',
+                scale_units='xy',
+                scale=0.01,
+                width=0.0035,
+            )
+
+            yaw_deg = float(yaw_angle)
+            rotor_width_mm = 2.0 * rotor_radius_mm * np.cos(np.deg2rad(abs(yaw_deg)))
+            rotor_height_mm = 2.0 * rotor_radius_mm
+            rotor_shape = Ellipse(
+                (0.0, 0.0),
+                width=rotor_width_mm,
+                height=rotor_height_mm,
+                angle=0.0,
+                fill=False,
+                color='black',
+                linewidth=1.1,
+            )
+            ax.add_patch(rotor_shape)
+
+            yc = self.wake_centers[yaw_angle]['Yc']
+            zc = self.wake_centers[yaw_angle]['Zc']
+            ax.scatter([yc], [zc], marker='d', c='yellow', s=80, edgecolors='black', linewidths=1.2, zorder=6)
+
+            wake_center_handle = ax.scatter([], [], marker='d', c='yellow', s=80, edgecolors='black', linewidths=1.2)
+            ax.legend(
+                [wake_center_handle],
+                [f"wake center\ny_off = {yc:.1f} mm\nz_off = {zc:.1f} mm"],
+                loc='upper right',
+                frameon=True,
+                fontsize=10,
+            )
+
+            ax.set_title(f"Yaw {yaw_angle}")
+            ax.set_xlabel('Y coordinate [mm]')
+            ax.set_aspect('equal', adjustable='box')
+            ax.grid(alpha=0.3, linestyle='--', linewidth=0.6)
+
+        axes[0].set_ylabel('Z coordinate [mm]')
+        fig.suptitle('Wake swirl map | Y-Z plane', y=0.98)
+        base_plot_right = 0.94
+        plot_right = base_plot_right * 0.98
+        fig.subplots_adjust(left=0.06, right=plot_right, bottom=0.11, top=0.89, wspace=0.12)
+        cax = fig.add_axes([plot_right + 0.02, 0.14, 0.018, 0.72])
+        cbar = fig.colorbar(contour_handle, cax=cax)
+        cbar.set_label('swirl intensity [m/s]')
+        cbar.ax.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
+
+        classic_path = os.path.join(output_folder, 'map_wake_swirl_y_z.png')
+        fig.savefig(classic_path, dpi=self.output_dpi)
+        plt.close(fig)
+
+        print("\n=== Wake Swirl Maps Summary ===")
+        print(f"Output folder: {output_folder}")
+        print(f"Output format: png, dpi={self.output_dpi}")
+        print(f"swirl intensity color limits=({swirl_min:.6g}, {swirl_max:.6g})")
+        print(f"  {classic_path}")
+
     def _extract_centerline_spectral_matrix(self, yaw_angle, z_target=0.0):
         if yaw_angle not in self.processed_data:
             raise ValueError(f"Yaw '{yaw_angle}' not found in processed_data.")
@@ -921,7 +1077,7 @@ class WakeMapGenerator:
             metric_entry = point_data['velocity']
             f_welch = np.asarray(metric_entry['fwelch']).reshape(-1)
             psd_welch = np.asarray(metric_entry['psdwelch']).reshape(-1)
-            if f_welch.shape != (1025,) or psd_welch.shape != (1025,):
+            if f_welch.shape != (2049,) or psd_welch.shape != (2049,):
                 raise ValueError(
                     f"Unexpected Welch shape at yaw {yaw_angle}, point {point_key}: "
                     f"fwelch={f_welch.shape}, psdwelch={psd_welch.shape}."
@@ -945,10 +1101,33 @@ class WakeMapGenerator:
         sort_idx = np.argsort(y_positions)
         return y_positions[sort_idx], f_reference, spectra[sort_idx, :]
 
-    def _plot_spatial_spectral_cascade(self, max_freq, filename):
-        subplot_payload = []
+    def _compute_spatial_spectral_color_limits(self, max_freq):
         global_vmin = None
         global_vmax = None
+
+        for yaw_angle in self.yaw_order:
+            _, frequencies, psd_matrix = self._extract_centerline_spectral_matrix(yaw_angle, z_target=0.0)
+            freq_mask = frequencies <= max_freq
+            if not np.any(freq_mask):
+                raise ValueError(f"No frequency bins found up to {max_freq} Hz for yaw {yaw_angle}.")
+
+            psd_sel = psd_matrix[:, freq_mask]
+            log_psd = np.log10(np.maximum(psd_sel, np.finfo(float).tiny))
+            local_min = float(np.min(log_psd))
+            local_max = float(np.max(log_psd))
+
+            global_vmin = local_min if global_vmin is None else min(global_vmin, local_min)
+            global_vmax = local_max if global_vmax is None else max(global_vmax, local_max)
+
+        if np.isclose(global_vmin, global_vmax):
+            global_vmin -= 1e-9
+            global_vmax += 1e-9
+
+        return global_vmin, global_vmax
+
+    def _plot_spatial_spectral_cascade(self, max_freq, filename, color_limits):
+        subplot_payload = []
+        global_vmin, global_vmax = color_limits
 
         for yaw_angle in self.yaw_order:
             y_positions, frequencies, psd_matrix = self._extract_centerline_spectral_matrix(yaw_angle, z_target=0.0)
@@ -960,11 +1139,6 @@ class WakeMapGenerator:
             psd_sel = psd_matrix[:, freq_mask]
             log_psd = np.log10(np.maximum(psd_sel, np.finfo(float).tiny))
 
-            local_min = float(np.min(log_psd))
-            local_max = float(np.max(log_psd))
-            global_vmin = local_min if global_vmin is None else min(global_vmin, local_min)
-            global_vmax = local_max if global_vmax is None else max(global_vmax, local_max)
-
             subplot_payload.append((yaw_angle, y_positions, freq_sel, log_psd))
 
         fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.6), sharey=True)
@@ -974,37 +1148,150 @@ class WakeMapGenerator:
         pcm = None
         for ax, (yaw_angle, y_positions, freq_sel, log_psd) in zip(axes, subplot_payload):
             pcm = ax.pcolormesh(
-                freq_sel,
                 y_positions,
-                log_psd,
+                freq_sel,
+                log_psd.T,
                 shading='auto',
                 cmap='viridis',
                 vmin=global_vmin,
                 vmax=global_vmax,
             )
             ax.set_title(f"Yaw {yaw_angle}")
-            ax.set_xlabel('Frequency [Hz]')
+            ax.set_xlabel('Y coordinate [mm]')
             ax.grid(alpha=0.2, linestyle='--', linewidth=0.5)
 
-        axes[0].set_ylabel('Y coordinate [mm]')
-        fig.suptitle(f"Spatial-Spectral Cascade | Z=0 mm | 0-{int(max_freq)} Hz", y=1.02)
-        cbar = fig.colorbar(pcm, ax=axes.ravel().tolist(), shrink=0.98)
+        axes[0].set_ylabel('Frequency [Hz]')
+        fig.suptitle(f"Spatial-Spectral Cascade | Z=0 mm | 0-{int(max_freq)} Hz", y=0.98)
+        base_plot_right = 0.94
+        plot_right = base_plot_right * 0.98
+        fig.subplots_adjust(left=0.06, right=plot_right, bottom=0.11, top=0.89, wspace=0.12)
+        cax = fig.add_axes([plot_right + 0.02, 0.14, 0.018, 0.72])
+        cbar = fig.colorbar(pcm, cax=cax)
         cbar.set_label('log10(psdwelch)')
+        cbar.ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        cbar.ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
 
         output_path = os.path.join(self.graph_output_folder, filename)
-        fig.tight_layout()
+        fig.savefig(output_path, dpi=self.output_dpi)
+        plt.close(fig)
+        return output_path, global_vmin, global_vmax
+
+    @staticmethod
+    def _interpolate_log_psd_field(y_positions, freq_sel, log_psd, y_points=260, f_points=520):
+        """Create a high-fidelity smooth spectral field via scipy.interpolate.griddata."""
+        y_mesh, freq_mesh = np.meshgrid(y_positions, freq_sel, indexing='xy')
+        points = np.column_stack([y_mesh.ravel(), freq_mesh.ravel()])
+        values = log_psd.ravel()
+
+        y_fine = np.linspace(float(y_positions.min()), float(y_positions.max()), y_points)
+        freq_fine = np.linspace(float(freq_sel.min()), float(freq_sel.max()), f_points)
+        y_fine_mesh, freq_fine_mesh = np.meshgrid(y_fine, freq_fine, indexing='xy')
+
+        field_cubic = griddata(points, values, (y_fine_mesh, freq_fine_mesh), method='cubic')
+        field_linear = griddata(points, values, (y_fine_mesh, freq_fine_mesh), method='linear')
+        field_nearest = griddata(points, values, (y_fine_mesh, freq_fine_mesh), method='nearest')
+
+        # Fill sparse regions robustly while preserving smooth interior interpolation.
+        filled = np.where(np.isnan(field_cubic), field_linear, field_cubic)
+        filled = np.where(np.isnan(filled), field_nearest, filled)
+
+        return y_fine_mesh, freq_fine_mesh, filled
+
+    def _plot_spatial_spectral_cascade_refined(self, max_freq, filename, color_limits):
+        subplot_payload = []
+        global_vmin, global_vmax = color_limits
+
+        for yaw_angle in self.yaw_order:
+            y_positions, frequencies, psd_matrix = self._extract_centerline_spectral_matrix(yaw_angle, z_target=0.0)
+            freq_mask = frequencies <= max_freq
+            if not np.any(freq_mask):
+                raise ValueError(f"No frequency bins found up to {max_freq} Hz for yaw {yaw_angle}.")
+
+            freq_sel = frequencies[freq_mask]
+            psd_sel = psd_matrix[:, freq_mask]
+            log_psd = np.log10(np.maximum(psd_sel, np.finfo(float).tiny))
+
+            subplot_payload.append((yaw_angle, y_positions, freq_sel, log_psd))
+
+        fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.6), sharey=True)
+        if not isinstance(axes, np.ndarray):
+            axes = np.asarray([axes])
+
+        contour_handle = None
+        bpf_hz = 38.6
+        for ax, (yaw_angle, y_positions, freq_sel, log_psd) in zip(axes, subplot_payload):
+            y_fine_mesh, freq_fine_mesh, field_fine = self._interpolate_log_psd_field(
+                y_positions,
+                freq_sel,
+                log_psd.T,
+            )
+
+            contour_handle = ax.contourf(
+                y_fine_mesh,
+                freq_fine_mesh,
+                field_fine,
+                levels=80,
+                cmap='viridis',
+                vmin=global_vmin,
+                vmax=global_vmax,
+            )
+
+            ax.set_title(f"Yaw {yaw_angle}")
+            ax.set_xlabel('Y coordinate [mm]')
+            ax.grid(alpha=0.4, linestyle='--', linewidth=0.5)
+
+            ax.axhline(y=bpf_hz, color='black', linestyle=':', linewidth=1.1)
+            x_left = float(np.min(y_positions)+0.02 * (float(np.max(y_positions)) - float(np.min(y_positions))))
+            y_offset = 0.02 * (float(np.max(freq_sel)) - float(np.min(freq_sel)))
+            ax.text(
+                x_left,
+                bpf_hz + y_offset,
+                'BPF',
+                color='black',
+                fontsize=11,
+                ha='left',
+                va='bottom',
+            )
+
+        axes[0].set_ylabel('Frequency [Hz]')
+        fig.suptitle(f"Spatial-Spectral Cascade (griddata refined) | Z=0 mm | 0-{int(max_freq)} Hz", y=0.98)
+        base_plot_right = 0.94
+        plot_right = base_plot_right * 0.98
+        fig.subplots_adjust(left=0.06, right=plot_right, bottom=0.11, top=0.89, wspace=0.12)
+        cax = fig.add_axes([plot_right + 0.02, 0.14, 0.018, 0.72])
+        cbar = fig.colorbar(contour_handle, cax=cax)
+        cbar.set_label('log10(psdwelch)')
+        cbar.ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        cbar.ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
+
+        output_path = os.path.join(self.graph_output_folder, filename)
         fig.savefig(output_path, dpi=self.output_dpi)
         plt.close(fig)
         return output_path, global_vmin, global_vmax
 
     def generate_spatial_spectral_cascade_maps(self):
+        shared_color_limits = self._compute_spatial_spectral_color_limits(max_freq=240.0)
+
         low_path, low_vmin, low_vmax = self._plot_spatial_spectral_cascade(
             max_freq=120.0,
             filename='cascade_centerline_0_120Hz.png',
+            color_limits=shared_color_limits,
         )
         broad_path, broad_vmin, broad_vmax = self._plot_spatial_spectral_cascade(
             max_freq=240.0,
             filename='cascade_centerline_0_240Hz.png',
+            color_limits=shared_color_limits,
+        )
+
+        low_refined_path, low_refined_vmin, low_refined_vmax = self._plot_spatial_spectral_cascade_refined(
+            max_freq=120.0,
+            filename='cascade_centerline_0_120Hz_refined.png',
+            color_limits=shared_color_limits,
+        )
+        broad_refined_path, broad_refined_vmin, broad_refined_vmax = self._plot_spatial_spectral_cascade_refined(
+            max_freq=240.0,
+            filename='cascade_centerline_0_240Hz_refined.png',
+            color_limits=shared_color_limits,
         )
 
         print("\n=== Spatial-Spectral Cascade Summary ===")
@@ -1012,8 +1299,12 @@ class WakeMapGenerator:
         print(f"Output format: png, dpi={self.output_dpi}")
         print(f"0-120 Hz color limits=({low_vmin:.6g}, {low_vmax:.6g})")
         print(f"0-240 Hz color limits=({broad_vmin:.6g}, {broad_vmax:.6g})")
+        print(f"0-120 Hz refined color limits=({low_refined_vmin:.6g}, {low_refined_vmax:.6g})")
+        print(f"0-240 Hz refined color limits=({broad_refined_vmin:.6g}, {broad_refined_vmax:.6g})")
         print(f"  {low_path}")
         print(f"  {broad_path}")
+        print(f"  {low_refined_path}")
+        print(f"  {broad_refined_path}")
 
 
 
@@ -1032,6 +1323,7 @@ if __name__ == "__main__":
     wake_map_generator.generate_representative_metric_maps()
     wake_map_generator.generate_tke_maps()
     wake_map_generator.generate_spatial_spectral_cascade_maps()
+    wake_map_generator.generate_wake_swirl_maps()
     
     # Show all plots in the end
     plt.show()
